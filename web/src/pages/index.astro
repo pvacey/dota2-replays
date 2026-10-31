@@ -1,0 +1,884 @@
+---
+// The dynamic replays app: the match list, the scoreboard, the parse progress,
+// and the fights figure for a parsed match. The browser talks only to the
+// replays backend; the figure DOM is built client-side per PLAN.md contract §7
+// (a port of src/figures/fights.ts without the side card).
+import "@fontsource-variable/source-serif-4/opsz.css";
+import "@fontsource-variable/source-serif-4/opsz-italic.css";
+import "@fontsource-variable/inter";
+import "@fontsource-variable/jetbrains-mono";
+import "../styles/tokens.css";
+import "../styles/base.css";
+import "../styles/home.css";
+import "../styles/prose.css";
+import "../styles/figures.css";
+import "../styles/fight-player.css";
+import mapHalf from "../data/map-half.json";
+
+const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ");
+---
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Replays — app | gem</title>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="app-side" aria-label="Matches">
+        <div class="app-side-head">
+          <h1>Matches</h1>
+          <button type="button" class="app-refresh" data-refresh aria-label="Refresh the match list">↻</button>
+        </div>
+        <p class="app-note" data-list-note>Loading matches…</p>
+        <ul class="match-list" data-matches hidden></ul>
+      </aside>
+      <main class="app-main">
+        <section class="scoreboard" data-scoreboard hidden aria-label="Scoreboard"></section>
+        <div class="app-body" data-body>
+          <p class="app-note">Loading matches…</p>
+        </div>
+      </main>
+    </div>
+
+    <!-- Contract §7's figure DOM, cloned per match (data-assets and the map
+         image href are filled on the clone). No fights-fig-side: figlib
+         tolerates its absence. -->
+    <template id="fights-fig-tpl">
+      <figure class="fig recipe-fig fights-fig" data-recipe-figure="fights" data-assets="" data-pagefind-ignore>
+        <div class="fights-fig-controls" data-controls hidden></div>
+        <div class="fights-fig-body">
+          <svg class="map" viewBox="0 0 1000 1000" role="img" aria-label="The fights on the map">
+            <image href="" width="1000" height="1000" preserveAspectRatio="xMidYMid slice"></image>
+            <rect class="map-dim" width="1000" height="1000"></rect>
+            <polyline class="map-half" points={points(mapHalf.half_line)}></polyline>
+            <g data-fights></g>
+          </svg>
+        </div>
+        <div class="fights-fig-strip" data-timeline hidden></div>
+        <div class="fights-fig-list" data-list hidden></div>
+        <div class="fights-fig-panel" data-panel hidden></div>
+        <figcaption>
+          <ul class="legend" aria-label="Legend">
+            <li class="legend-item team-radiant"><i aria-hidden="true"></i>Radiant had more kills</li>
+            <li class="legend-item team-dire"><i aria-hidden="true"></i>Dire had more kills</li>
+            <li class="legend-item team-even"><i aria-hidden="true"></i>Even</li>
+            <li class="legend-item"><i class="swatch-size" aria-hidden="true"></i>Size: deaths in the fight</li>
+          </ul>
+        </figcaption>
+      </figure>
+    </template>
+
+    <script>
+      import type { FightData } from "../lib/fight-playback";
+      import type { FightsData } from "../lib/fights-data";
+
+      interface MatchListItem {
+        match_id: number;
+        latest_timestamp: string;
+      }
+      interface PlayerRow {
+        player: string;
+        hero: string;
+        hero_icon: string;
+        kills: number;
+        deaths: number;
+        assists: number;
+        net_worth: number;
+        level: number;
+        gpm: number;
+        hero_damage: number;
+      }
+      interface Scoreboard {
+        duration_s: number;
+        radiant_win: boolean;
+        radiant_score: number;
+        dire_score: number;
+        turbo: boolean;
+        radiant: PlayerRow[];
+        dire: PlayerRow[];
+      }
+      interface MatchInfo {
+        match_id: number;
+        parsed: boolean;
+        parse_error: string | null;
+        scoreboard: Scoreboard | null;
+        scoreboard_error?: string | null;
+      }
+      interface ParseStatus {
+        stage: string;
+        pct: number | null;
+        log: string[];
+        done: boolean;
+        error: string | null;
+      }
+      type RowState = "fetching" | "error" | boolean;
+
+      const bust = () => `t=${Date.now()}`;
+      const text = (s: string) =>
+        s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+      const mmss = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+      const gold = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`);
+      const note = (msg: string) => {
+        const p = document.createElement("p");
+        p.className = "app-note";
+        p.textContent = msg;
+        return p;
+      };
+      const errorNote = (msg: string) => {
+        const p = document.createElement("p");
+        p.className = "app-error";
+        p.textContent = msg;
+        return p;
+      };
+
+      const $ = <T extends Element>(sel: string) => document.querySelector<T>(sel)!;
+      const listEl = $<HTMLUListElement>("[data-matches]");
+      const listNote = $<HTMLParagraphElement>("[data-list-note]");
+      const scoreboardEl = $<HTMLElement>("[data-scoreboard]");
+      const bodyEl = $<HTMLElement>("[data-body]");
+      const figureTpl = $<HTMLTemplateElement>("#fights-fig-tpl");
+      $<HTMLButtonElement>("[data-refresh]").addEventListener("click", () => void loadList());
+
+      // Two sequence tokens: the list (refresh) and the selection (parse poll,
+      // figure load) evolve independently; stale responses are dropped.
+      let listSeq = 0;
+      let matchSeq = 0;
+      let selected: number | null = null;
+      let pollTimer: ReturnType<typeof setInterval> | null = null;
+      const rowStates = new Map<number, RowState>();
+
+      const stopPoll = () => {
+        if (pollTimer !== null) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+      };
+
+      // --- The match list ---
+
+      function stateHtml(state: RowState | undefined): string {
+        if (state === true) return `<span class="match-done">✓ parsed</span>`;
+        if (state === false) return `<span class="match-todo">not parsed</span>`;
+        if (state === "error") return `<span class="match-state-err" title="state unknown">—</span>`;
+        return `<span class="spinner" role="status" aria-label="Checking"></span>`;
+      }
+
+      function updateRowState(id: number): void {
+        const box = listEl.querySelector(`[data-match="${id}"] [data-state]`);
+        if (box) box.innerHTML = stateHtml(rowStates.get(id));
+      }
+
+      async function fillState(id: number): Promise<void> {
+        const ticket = listSeq;
+        rowStates.set(id, "fetching");
+        updateRowState(id);
+        let parsed: boolean;
+        try {
+          const res = await fetch(`/api/matches/${id}?${bust()}`);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          parsed = ((await res.json()) as MatchInfo).parsed;
+        } catch {
+          if (ticket !== listSeq) return;
+          rowStates.set(id, "error");
+          updateRowState(id);
+          return;
+        }
+        if (ticket !== listSeq) return;
+        rowStates.set(id, parsed);
+        updateRowState(id);
+      }
+
+      function rowFor(m: MatchListItem, shared = false): HTMLLIElement {
+        const when = new Date(m.latest_timestamp.replace(" ", "T") + "Z");
+        const date = shared
+          ? "shared"
+          : Number.isNaN(when.getTime())
+            ? m.latest_timestamp
+            : when.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+        const li = document.createElement("li");
+        li.innerHTML =
+          `<button type="button" class="match-row" data-match="${m.match_id}" aria-pressed="${String(m.match_id === selected)}">` +
+          `<span class="match-row-top"><span class="match-id">${m.match_id}</span>` +
+          `<span class="match-state" data-state>${stateHtml(rowStates.get(m.match_id))}</span></span>` +
+          `<span class="match-date">${text(date)}</span>` +
+          `</button>`;
+        li.querySelector("button")!.addEventListener("click", () => selectMatch(m.match_id));
+        return li;
+      }
+
+      async function loadList(): Promise<void> {
+        const ticket = ++listSeq;
+        listNote.hidden = false;
+        listNote.textContent = "Loading matches…";
+        listEl.hidden = true;
+        listEl.replaceChildren();
+        let items: MatchListItem[];
+        try {
+          const res = await fetch(`/api/matches?${bust()}`);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          items = ((await res.json()) as { matches: MatchListItem[] }).matches;
+        } catch (err) {
+          if (ticket !== listSeq) return;
+          const msg = `Could not load matches: ${(err as Error).message}`;
+          listNote.textContent = msg;
+          if (selected === null) bodyEl.replaceChildren(errorNote(msg));
+          return;
+        }
+        if (ticket !== listSeq) return;
+        listNote.hidden = true;
+        listEl.hidden = false;
+        listEl.replaceChildren(...items.map((m) => rowFor(m)));
+        // A shared match outside the recent list rides along as an extra row.
+        if (selected !== null && !items.some((m) => m.match_id === selected)) {
+          listEl.prepend(rowFor({ match_id: selected, latest_timestamp: "" }, true));
+          if (!rowStates.has(selected)) void fillState(selected);
+        }
+        for (const m of items) void fillState(m.match_id);
+        if (selected !== null) return;
+        if (items.length === 0) {
+          listEl.hidden = true;
+          listNote.hidden = false;
+          listNote.textContent = "No matches yet.";
+          bodyEl.replaceChildren(note("No matches yet."));
+          return;
+        }
+        selectMatch(items[0].match_id);
+      }
+
+      // Shareable selection: read once on load, mirrored back on every change
+      // (replaceState — no reload, no history entries). Non-numeric ?m= falls
+      // back to the newest match.
+      const paramId = (): number | null => {
+        const raw = new URLSearchParams(location.search).get("m");
+        if (raw === null || !/^\d+$/.test(raw)) return null;
+        const id = Number(raw);
+        return Number.isSafeInteger(id) && id > 0 ? id : null;
+      };
+      const syncUrl = (id: number): void => {
+        const url = new URL(location.href);
+        url.searchParams.set("m", `${id}`);
+        history.replaceState(null, "", url);
+      };
+
+      function selectMatch(id: number): void {
+        if (id === selected) return;
+        matchSeq += 1;
+        stopPoll();
+        selected = id;
+        syncUrl(id);
+        for (const btn of listEl.querySelectorAll<HTMLButtonElement>("[data-match]"))
+          btn.setAttribute("aria-pressed", String(Number(btn.dataset.match) === id));
+        void loadMatch(id);
+      }
+
+      // --- The selected match: scoreboard + body ---
+
+      async function loadMatch(id: number): Promise<void> {
+        const ticket = ++matchSeq;
+        scoreboardEl.hidden = true;
+        scoreboardEl.replaceChildren();
+        bodyEl.replaceChildren(note("Loading match…"));
+        let info: MatchInfo;
+        try {
+          const res = await fetch(`/api/matches/${id}?${bust()}`);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          info = (await res.json()) as MatchInfo;
+        } catch (err) {
+          if (ticket !== matchSeq) return;
+          bodyEl.replaceChildren(note(`Could not load match ${id}: ${(err as Error).message}`));
+          return;
+        }
+        if (ticket !== matchSeq) return;
+        rowStates.set(id, info.parsed);
+        updateRowState(id);
+        renderScoreboard(info);
+        if (info.parsed) await showFigure(id, ticket);
+        else showUnparsed(id, info);
+      }
+
+      function teamTable(side: "radiant" | "dire", rows: PlayerRow[], winner: boolean): string {
+        const cells = (p: PlayerRow) =>
+          `<tr>` +
+          `<td class="sb-player">${text(p.player)}</td>` +
+          `<td class="sb-hero"><img class="sb-icon sb-icon--${side}" src="/data/icons/heroes/${text(p.hero_icon)}.png" alt="" width="26" height="26" loading="lazy"><span>${text(p.hero)}</span></td>` +
+          `<td class="num">${p.kills}</td><td class="num">${p.deaths}</td><td class="num">${p.assists}</td>` +
+          `<td class="num">${gold(p.net_worth)}</td><td class="num">${p.level}</td><td class="num">${p.gpm}</td><td class="num">${gold(p.hero_damage)}</td>` +
+          `</tr>`;
+        return (
+          `<section class="sb-team">` +
+          `<h2 class="sb-head sb-head--${side}">${side === "radiant" ? "Radiant" : "Dire"}${winner ? `<span class="sb-winner">Winner</span>` : ""}</h2>` +
+          `<table class="sb-table"><thead><tr>` +
+          `<th>Player</th><th>Hero</th><th class="num">K</th><th class="num">D</th><th class="num">A</th>` +
+          `<th class="num">Net</th><th class="num">Lvl</th><th class="num">GPM</th><th class="num">Dmg</th>` +
+          `</tr></thead><tbody>${rows.map(cells).join("")}</tbody></table>` +
+          `</section>`
+        );
+      }
+
+      function renderScoreboard(info: MatchInfo): void {
+        const sb = info.scoreboard;
+        if (!sb) {
+          if (!info.scoreboard_error) return;
+          scoreboardEl.hidden = false;
+          scoreboardEl.innerHTML = `<p class="sb-error">${text(info.scoreboard_error)}</p>`;
+          return;
+        }
+        const rNet = sb.radiant.reduce((n, p) => n + p.net_worth, 0);
+        const dNet = sb.dire.reduce((n, p) => n + p.net_worth, 0);
+        scoreboardEl.hidden = false;
+        scoreboardEl.innerHTML =
+          `<div class="sb-teams">${teamTable("radiant", sb.radiant, sb.radiant_win)}${teamTable("dire", sb.dire, !sb.radiant_win)}</div>` +
+          `<div class="sb-foot">` +
+          `<span class="sb-stat"><b>${mmss(sb.duration_s)}</b> duration</span>` +
+          `<span class="sb-stat"><b>${sb.radiant_score}–${sb.dire_score}</b> kills</span>` +
+          `<span class="sb-stat"><b>${gold(rNet)}</b> Radiant net</span>` +
+          `<span class="sb-stat"><b>${gold(dNet)}</b> Dire net</span>` +
+          (sb.turbo ? `<span class="tag-turbo">TURBO</span>` : "") +
+          `</div>`;
+      }
+
+      // --- The fights figure (contract §7) ---
+
+      async function showFigure(id: number, ticket: number): Promise<void> {
+        bodyEl.replaceChildren(note("Loading fights…"));
+        let index: FightsData;
+        try {
+          const res = await fetch(`/data/matches/${id}/fights/index.json`);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          index = (await res.json()) as FightsData;
+        } catch (err) {
+          if (ticket !== matchSeq) return;
+          bodyEl.replaceChildren(note(`Could not load the fights: ${(err as Error).message}`));
+          return;
+        }
+        if (ticket !== matchSeq) return;
+        const [{ mountFightsFigure }, { fightDots }] = await Promise.all([
+          import("../lib/fights-figure"),
+          import("../lib/fights-data"),
+        ]);
+        if (ticket !== matchSeq) return;
+        const figure = figureTpl.content.firstElementChild!.cloneNode(true) as HTMLElement;
+        const assets = `/data/matches/${id}/figures/`;
+        figure.dataset.assets = assets;
+        figure.querySelector("image")!.setAttribute("href", `${assets}map.webp`);
+        figure.querySelector<SVGGElement>("[data-fights]")!.innerHTML = fightDots(index.fights);
+        const head = document.createElement("div");
+        head.className = "fights-head";
+        head.innerHTML =
+          `<h2>Fights on the map</h2>` +
+          `<p>Every fight in this match is a dot on the map. Bigger dots mean more deaths; the color shows which team got more kills in that fight. Click a dot or a row in the fight list to open that fight's breakdown below.</p>`;
+        bodyEl.replaceChildren(head, figure);
+        mountFightsFigure(figure, index, {
+          loadFight: (file) =>
+            fetch(`/data/matches/${id}/${file}`)
+              .then((r) => r.json())
+              .then((j) => ({ default: j as FightData })),
+          icons: null,
+        });
+      }
+
+      // --- Unparsed: the parse button, the progress, the log ---
+
+      function showUnparsed(id: number, info: MatchInfo): void {
+        bodyEl.replaceChildren();
+        const panel = document.createElement("section");
+        panel.className = "parse-panel";
+        panel.innerHTML =
+          `<h2>Not parsed yet</h2>` +
+          `<p class="app-note">This match has no fight breakdown on disk. Parsing downloads the replay and builds one; the raw replay is deleted after a successful parse.</p>` +
+          (info.parse_error ? `<p class="app-error">${text(info.parse_error)}</p>` : "") +
+          `<p><button type="button" class="button button--primary" data-parse>Parse replay</button></p>` +
+          `<div data-parse-view></div>`;
+        const view = panel.querySelector<HTMLElement>("[data-parse-view]")!;
+        panel.querySelector<HTMLButtonElement>("[data-parse]")!.addEventListener("click", () => void startParse(id, view));
+        bodyEl.append(panel);
+      }
+
+      async function startParse(id: number, view: HTMLElement): Promise<void> {
+        const ticket = matchSeq;
+        view.replaceChildren(note("Starting…"));
+        let res: Response;
+        try {
+          res = await fetch(`/api/parse/${id}`, { method: "POST" });
+        } catch (err) {
+          if (ticket !== matchSeq) return;
+          view.replaceChildren(errorNote(`Could not reach the server: ${(err as Error).message}`));
+          return;
+        }
+        if (ticket !== matchSeq) return;
+        const body = (await res.json().catch(() => ({}))) as { status?: string };
+        if (res.status === 202 || (res.status === 409 && body.status === "already_running")) {
+          watchParse(id, view, ticket);
+          return;
+        }
+        if (res.status === 409 && body.status === "already_parsed") {
+          view.replaceChildren(note("Already parsed — loading…"));
+          void loadMatch(id);
+          return;
+        }
+        const msg =
+          res.status === 404
+            ? "No replay is available for this match — it may have expired."
+            : res.status === 502
+              ? `OpenDota lookup failed${body.status ? ` (${body.status})` : ""}.`
+              : `Parse request failed (HTTP ${res.status}${body.status ? `: ${body.status}` : ""}).`;
+        view.replaceChildren(errorNote(msg));
+      }
+
+      function watchParse(id: number, view: HTMLElement, ticket: number): void {
+        stopPoll();
+        view.replaceChildren();
+        const bar = document.createElement("div");
+        bar.className = "parse-bar is-indeterminate";
+        bar.innerHTML = `<div class="parse-bar-fill"></div>`;
+        const stage = document.createElement("p");
+        stage.className = "parse-stage";
+        stage.textContent = "queued";
+        const log = document.createElement("pre");
+        log.className = "parse-log";
+        log.setAttribute("aria-label", "Parse log");
+        view.append(bar, stage, log);
+        let busy = false;
+        const tick = async () => {
+          if (busy) return;
+          busy = true;
+          try {
+            const res = await fetch(`/api/parse/${id}/status?${bust()}`);
+            if (ticket !== matchSeq) {
+              stopPoll();
+              return;
+            }
+            if (!res.ok) {
+              stopPoll();
+              view.replaceChildren(errorNote(`Parse status unavailable (HTTP ${res.status}).`), log);
+              return;
+            }
+            const st = (await res.json()) as ParseStatus;
+            if (ticket !== matchSeq) {
+              stopPoll();
+              return;
+            }
+            stage.textContent = `${st.stage}${st.pct === null ? "" : ` · ${Math.round(st.pct)}%`}`;
+            const fill = bar.firstElementChild as HTMLElement;
+            if (st.pct === null) {
+              bar.classList.add("is-indeterminate");
+              fill.removeAttribute("style");
+            } else {
+              bar.classList.remove("is-indeterminate");
+              fill.style.width = `${Math.min(100, Math.max(0, st.pct))}%`;
+            }
+            log.textContent = st.log.join("\n");
+            log.scrollTop = log.scrollHeight;
+            if (st.done) {
+              stopPoll();
+              rowStates.set(id, true);
+              updateRowState(id);
+              void loadMatch(id);
+            } else if (st.error) {
+              stopPoll();
+              const box = document.createElement("div");
+              box.className = "parse-failed";
+              box.append(errorNote(st.error), log);
+              view.replaceChildren(box);
+            }
+          } catch {
+            // A transient fetch failure just waits for the next tick.
+            if (ticket !== matchSeq) stopPoll();
+          } finally {
+            busy = false;
+          }
+        };
+        pollTimer = setInterval(() => void tick(), 1000);
+        void tick();
+      }
+
+      // Auto-load: a shared ?m= selects immediately (the list fills in around
+      // it); otherwise wait for the list to know which match is newest.
+      const initialId = paramId();
+      if (initialId !== null) selectMatch(initialId);
+      void loadList();
+    </script>
+    <style is:global>
+      /* The app chrome, over the site's tokens. */
+      .app {
+        display: grid;
+        grid-template-columns: 260px minmax(0, 1fr);
+        gap: 40px;
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: 28px 28px 80px;
+      }
+      .app-side {
+        position: sticky;
+        top: 28px;
+        align-self: start;
+        display: flex;
+        flex-direction: column;
+        max-height: calc(100vh - 56px);
+      }
+      .app-side-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid var(--rule);
+      }
+      .app-side h1 {
+        margin: 0;
+        color: var(--ink);
+        font-family: var(--font-serif);
+        font-size: 24px;
+        font-weight: 450;
+        letter-spacing: -0.01em;
+      }
+      .app-refresh {
+        display: grid;
+        place-items: center;
+        width: 30px;
+        height: 30px;
+        padding: 0;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: none;
+        color: var(--muted);
+        font-size: 15px;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .app-refresh:hover {
+        color: var(--ink);
+        border-color: var(--rule);
+      }
+      .app-note {
+        color: var(--muted);
+        font-size: 14.5px;
+      }
+      .app-error {
+        color: var(--danger);
+        font-size: 14px;
+      }
+
+      .match-list {
+        margin: 8px 0 0;
+        padding: 0;
+        overflow-y: auto;
+        list-style: none;
+        font-size: 13.5px;
+      }
+      .match-row {
+        display: block;
+        width: 100%;
+        padding: 8px 10px;
+        border: 0;
+        border-radius: 6px;
+        background: none;
+        color: inherit;
+        font: inherit;
+        text-align: left;
+        cursor: pointer;
+      }
+      .match-row:hover,
+      .match-row[aria-pressed="true"] {
+        background: var(--accent-soft);
+      }
+      .match-row[aria-pressed="true"] {
+        color: var(--ink);
+      }
+      .match-row-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .match-id {
+        color: var(--ink);
+        font-family: var(--font-mono);
+        font-size: 12.5px;
+      }
+      .match-date {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .match-state {
+        color: var(--muted);
+        font-size: 11.5px;
+        white-space: nowrap;
+      }
+      .match-done {
+        color: var(--accent);
+      }
+      .match-todo {
+        color: var(--muted);
+      }
+
+      .app-main {
+        min-width: 0;
+      }
+
+      /* Scoreboard */
+      .scoreboard {
+        margin: 0 0 28px;
+      }
+      .sb-teams {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 28px;
+      }
+      .sb-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 0 0 6px;
+        padding-bottom: 6px;
+        border-bottom: 1px solid var(--rule);
+        color: var(--ink);
+        font-family: var(--font-serif);
+        font-size: 20px;
+        font-weight: 450;
+      }
+      .sb-head::before {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        content: "";
+      }
+      .sb-head--radiant::before {
+        background: var(--map-radiant-mark);
+      }
+      .sb-head--dire::before {
+        background: var(--map-dire-mark);
+      }
+      .sb-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+      .sb-table th {
+        padding: 4px 6px;
+        border-bottom: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 10.5px;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-align: left;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+      .sb-table td {
+        padding: 5px 6px;
+        border-bottom: 1px solid var(--line);
+        color: var(--ink);
+        white-space: nowrap;
+        vertical-align: middle;
+      }
+      .sb-table .num {
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+      .sb-player {
+        max-width: 96px;
+        overflow: hidden;
+        color: var(--body);
+        text-overflow: ellipsis;
+      }
+      .sb-hero {
+        max-width: 176px;
+        overflow: hidden;
+      }
+      .sb-hero span {
+        display: inline-block;
+        max-width: 134px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        vertical-align: middle;
+        white-space: nowrap;
+      }
+      .sb-icon {
+        width: 26px;
+        height: 26px;
+        margin-right: 7px;
+        border: 1.5px solid;
+        border-radius: 50%;
+        object-fit: cover;
+        vertical-align: middle;
+      }
+      .sb-icon--radiant {
+        border-color: var(--map-radiant-mark);
+      }
+      .sb-icon--dire {
+        border-color: var(--map-dire-mark);
+      }
+      .sb-foot {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        gap: 8px 22px;
+        margin-top: 14px;
+        padding-top: 12px;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .sb-stat b {
+        color: var(--ink);
+        font-variant-numeric: tabular-nums;
+      }
+      .sb-winner {
+        padding: 1px 8px;
+        border: 1px solid var(--rule);
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent);
+        font-family: var(--font-sans);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+      .tag-turbo {
+        padding: 1px 8px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+      }
+      .sb-error {
+        margin: 0;
+        color: var(--muted);
+        font-size: 13.5px;
+      }
+
+      /* The unparsed panel and the parse progress */
+      .parse-panel {
+        max-width: 620px;
+        margin: 56px auto;
+        text-align: center;
+      }
+      .parse-panel h2 {
+        margin: 0 0 10px;
+        color: var(--ink);
+        font-family: var(--font-serif);
+        font-size: 28px;
+        font-weight: 450;
+      }
+      .parse-panel .app-note {
+        max-width: 480px;
+        margin: 0 auto 18px;
+      }
+      .parse-panel [data-parse-view] {
+        margin-top: 22px;
+        text-align: left;
+      }
+      .parse-bar {
+        height: 8px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: var(--line);
+      }
+      .parse-bar-fill {
+        height: 100%;
+        width: 0;
+        border-radius: inherit;
+        background: var(--accent);
+      }
+      .parse-bar.is-indeterminate .parse-bar-fill {
+        width: 100%;
+        background: linear-gradient(90deg, transparent 15%, var(--accent) 50%, transparent 85%);
+        background-size: 200% 100%;
+        animation: parse-shimmer 1.4s ease-in-out infinite;
+      }
+      @keyframes parse-shimmer {
+        from {
+          background-position: 120% 0;
+        }
+        to {
+          background-position: -120% 0;
+        }
+      }
+      .parse-stage {
+        margin: 10px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .parse-log {
+        max-height: 260px;
+        margin: 12px 0 0;
+        padding: 10px 12px;
+        overflow-y: auto;
+        border: 1px solid var(--code-border);
+        border-radius: 6px;
+        background: var(--code-bg);
+        color: var(--code-fg);
+        font-family: var(--font-mono);
+        font-size: 12px;
+        line-height: 1.6;
+        text-align: left;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .spinner {
+        display: inline-block;
+        width: 11px;
+        height: 11px;
+        border: 2px solid var(--line);
+        border-top-color: var(--accent);
+        border-radius: 50%;
+        animation: spin 0.7s linear infinite;
+        vertical-align: -1px;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      .fights-head {
+        margin: 0 0 18px;
+      }
+      .fights-head h2 {
+        margin: 0;
+        color: var(--ink);
+        font-family: var(--font-serif);
+        font-size: 20px;
+        font-weight: 450;
+      }
+      .fights-head p {
+        max-width: 720px;
+        margin: 8px 0 0;
+        color: var(--muted);
+        font-size: 14.5px;
+        line-height: 1.55;
+      }
+      .fights-head + .fights-fig {
+        margin-top: 0;
+      }
+
+      /* This page has no fights-fig-side card: the map takes the figure's full
+         width (figures.css's :has() rule only matches a hidden side child). */
+      .fights-fig-body:not(:has(> .fights-fig-side)) {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      @media (max-width: 900px) {
+        .app {
+          grid-template-columns: minmax(0, 1fr);
+          gap: 24px;
+          padding: 20px 16px 64px;
+        }
+        .app-side {
+          position: static;
+          max-height: 340px;
+        }
+        .sb-teams {
+          grid-template-columns: minmax(0, 1fr);
+        }
+      }
+    </style>
+  </body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "scripts": {
+    "replays": {
+      "type": "service",
+      "command": "cd /home/paseo/replays && /home/paseo/bin/uv run --frozen python backend/server.py"
+    }
+  }
+}
