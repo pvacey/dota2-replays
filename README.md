@@ -14,8 +14,9 @@ casts, damage, disables, deaths and smokes on every replay packet of the fight.
   `figures/map.webp` + `figures/fights/N.webp` (map crops).
 - **Frontend** — `web/`, an Astro app built with bun; the server serves
   `web/dist` as static files.
-- **Data** — `data/` holds vendored hero/item icons and the 7.41 map image
-  (the `gem-dota` wheel ships none of these); `var/` (gitignored) holds
+- **Data** — `data/` is generated, not committed. Hero/item icons and the 7.41
+  map image are fetched on first run (see `scripts/fetch_assets.py`; gem's
+  catalog JSONs come from the pinned wheel). `var/` (gitignored) holds
   runtime data: parsed matches in `var/store/matches/`, job state in
   `var/jobs/`, downloaded replays in `var/replays/`.
 
@@ -36,6 +37,7 @@ local data are relative to the repo root.
 
 ```bash
 uv sync                      # python deps + .venv
+uv run scripts/fetch_assets.py   # populate data/ (icons, map, catalog json)
 cd web && bun install        # js deps
 cd web && bun run check      # astro typecheck
 cd web && bun run build      # build dist for the backend to serve
