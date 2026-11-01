@@ -22,13 +22,35 @@ casts, damage, disables, deaths and smokes on every replay packet of the fight.
 
 ## Run
 
-Paseo workspace; the `replays` service runs the backend:
+The Docker image builds the Astro site (bun), installs the Python deps (uv)
+and bakes `data/` (icons, map, catalog) at build time:
 
 ```bash
-paseo script start replays
+docker build -t replays .
+docker run --rm -p 8000:8000 -v replays-var:/app/var replays
 ```
 
-Backend serves on `$PASEO_PORT` (default 8000).
+Mount a volume at `/app/var` to keep parsed matches, job state and downloaded
+replays across restarts. The container needs network only for the app's own
+services: ClickHouse (match list), OpenDota (scoreboards, replay URLs) and the
+replay CDN (parse jobs).
+
+In a paseo workspace, `paseo script start replays` still runs the backend
+(paseo.json passes `$PASEO_PORT` on as `PORT`).
+
+### Environment
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PORT` | `8000` | Port the backend binds (`0.0.0.0`). |
+| `CH_URL` | `http://clickhouse-service.cluster-services.svc.cluster.local:8123/` | ClickHouse HTTP endpoint the match list queries. |
+
+`OD_URL` (OpenDota API base for scoreboards and replay URLs) is a constant in
+`backend/server.py`.
+
+Kubernetes: set `containerPort` from `PORT` and probe `/` (the home page,
+200). `/api/matches` answers 503 while `CH_URL` is unreachable, which the UI
+treats as "no match list".
 
 ## Development
 
@@ -52,7 +74,7 @@ uv run python pipeline/export_match.py <replay.dem> \
 
 ## Config
 
-- Match list comes from ClickHouse (`CH_URL` in `backend/server.py`, default
+- Match list comes from ClickHouse (`CH_URL` env, default
   `http://clickhouse-service.cluster-services.svc.cluster.local:8123/`).
 - Scoreboards come from OpenDota (cached per match in the store).
 - Parse jobs: `POST /api/parse/{id}`; the single worker processes one match at

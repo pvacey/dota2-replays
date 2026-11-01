@@ -3,7 +3,7 @@
   "scripts": {
     "replays": {
       "type": "service",
-      "command": "cd /home/paseo/replays && /home/paseo/bin/uv run --frozen python backend/server.py"
+      "command": "cd /home/paseo/replays && PORT=${PASEO_PORT:-8000} /home/paseo/bin/uv run --frozen python backend/server.py"
     }
   }
 }

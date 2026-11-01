@@ -31,9 +31,10 @@ MATCHES = STORE / "matches"
 JOBS = ROOT / "var" / "jobs"
 REPLAYS = ROOT / "var" / "replays"
 
-CH_URL = "http://clickhouse-service.cluster-services.svc.cluster.local:8123/"
+CH_URL = os.environ.get(
+    "CH_URL", "http://clickhouse-service.cluster-services.svc.cluster.local:8123/")
 OD_URL = "https://api.opendota.com/api/matches/"
-USER_AGENT = "replays-app/1.0"
+USER_AGENT = "dota2-replays/1.0"
 SQL = (
     "SELECT match_id, MAX(timestamp) AS latest_timestamp FROM dota_events "
     "WHERE match_id != 0 GROUP BY match_id ORDER BY latest_timestamp DESC "
@@ -428,7 +429,8 @@ class Handler(BaseHTTPRequestHandler):
     def api_matches(self) -> None:
         req = urllib.request.Request(
             CH_URL, data=SQL.encode("utf-8"),
-            headers={"Content-Type": "text/plain"}, method="POST")
+            headers={"Content-Type": "text/plain", "User-Agent": USER_AGENT},
+            method="POST")
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 raw = resp.read().decode("utf-8")
@@ -519,7 +521,7 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     STORE.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=worker, daemon=True).start()
-    port = int(os.environ.get("PASEO_PORT", "8000"))
+    port = int(os.environ.get("PORT", "8000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"replays backend on 0.0.0.0:{port}", flush=True)
     server.serve_forever()
