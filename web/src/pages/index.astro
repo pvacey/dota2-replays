@@ -62,14 +62,6 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         <div class="fights-fig-strip" data-timeline hidden></div>
         <div class="fights-fig-list" data-list hidden></div>
         <div class="fights-fig-panel" data-panel hidden></div>
-        <figcaption>
-          <ul class="legend" aria-label="Legend">
-            <li class="legend-item team-radiant"><i aria-hidden="true"></i>Radiant had more kills</li>
-            <li class="legend-item team-dire"><i aria-hidden="true"></i>Dire had more kills</li>
-            <li class="legend-item team-even"><i aria-hidden="true"></i>Even</li>
-            <li class="legend-item"><i class="swatch-size" aria-hidden="true"></i>Size: deaths in the fight</li>
-          </ul>
-        </figcaption>
       </figure>
     </template>
 
@@ -94,6 +86,7 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         hero_damage: number;
       }
       interface Scoreboard {
+        start_time: number | null;
         duration_s: number;
         radiant_win: boolean;
         radiant_score: number;
@@ -301,7 +294,7 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         else showUnparsed(id, info);
       }
 
-      function teamTable(side: "radiant" | "dire", rows: PlayerRow[], winner: boolean): string {
+      function teamTable(side: "radiant" | "dire", rows: PlayerRow[], winner: boolean, kills: number): string {
         const cells = (p: PlayerRow) =>
           `<tr>` +
           `<td class="sb-player">${text(p.player)}</td>` +
@@ -311,13 +304,28 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
           `</tr>`;
         return (
           `<section class="sb-team">` +
-          `<h2 class="sb-head sb-head--${side}">${side === "radiant" ? "Radiant" : "Dire"}${winner ? `<span class="sb-winner">Winner</span>` : ""}</h2>` +
+          `<h2 class="sb-head sb-head--${side}">${side === "radiant" ? "Radiant" : "Dire"}` +
+          `<span class="sb-score">${kills}</span>` +
+          `${winner ? `<span class="sb-winner">Winner</span>` : ""}</h2>` +
           `<table class="sb-table"><thead><tr>` +
           `<th>Player</th><th>Hero</th><th class="num">K</th><th class="num">D</th><th class="num">A</th>` +
           `<th class="num">Net</th><th class="num">Lvl</th><th class="num">GPM</th><th class="num">Dmg</th>` +
           `</tr></thead><tbody>${rows.map(cells).join("")}</tbody></table>` +
           `</section>`
         );
+      }
+
+      function whenLabel(start: number | null): string {
+        if (start === null || !Number.isFinite(start)) return "";
+        const d = new Date(start * 1000);
+        if (Number.isNaN(d.getTime())) return "";
+        return d.toLocaleString(undefined, {
+          month: "short",
+          day: "numeric",
+          year: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+        });
       }
 
       function renderScoreboard(info: MatchInfo): void {
@@ -328,17 +336,19 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
           scoreboardEl.innerHTML = `<p class="sb-error">${text(info.scoreboard_error)}</p>`;
           return;
         }
-        const rNet = sb.radiant.reduce((n, p) => n + p.net_worth, 0);
-        const dNet = sb.dire.reduce((n, p) => n + p.net_worth, 0);
+        const when = whenLabel(sb.start_time);
         scoreboardEl.hidden = false;
         scoreboardEl.innerHTML =
-          `<div class="sb-teams">${teamTable("radiant", sb.radiant, sb.radiant_win)}${teamTable("dire", sb.dire, !sb.radiant_win)}</div>` +
-          `<div class="sb-foot">` +
-          `<span class="sb-stat"><b>${mmss(sb.duration_s)}</b> duration</span>` +
-          `<span class="sb-stat"><b>${sb.radiant_score}–${sb.dire_score}</b> kills</span>` +
-          `<span class="sb-stat"><b>${gold(rNet)}</b> Radiant net</span>` +
-          `<span class="sb-stat"><b>${gold(dNet)}</b> Dire net</span>` +
+          `<div class="sb-bar">` +
+          `<span class="sb-when">${text(when ? `${when} - Match ${info.match_id}` : `Match ${info.match_id}`)}</span>` +
+          `<span class="sb-meta">` +
+          `<span class="sb-dur">${mmss(sb.duration_s)}</span>` +
           (sb.turbo ? `<span class="tag-turbo">TURBO</span>` : "") +
+          `</span>` +
+          `</div>` +
+          `<div class="sb-teams">` +
+          teamTable("radiant", sb.radiant, sb.radiant_win, sb.radiant_score) +
+          teamTable("dire", sb.dire, !sb.radiant_win, sb.dire_score) +
           `</div>`;
       }
 
@@ -523,6 +533,7 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         color: var(--ink);
         font-family: var(--font-serif);
         font-size: 34px;
+        font-style: italic;
         font-weight: 450;
         letter-spacing: -0.02em;
       }
@@ -728,19 +739,36 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       .sb-icon--dire {
         border-color: var(--map-dire-mark);
       }
-      .sb-foot {
+      .sb-bar {
         display: flex;
         flex-wrap: wrap;
         align-items: baseline;
-        gap: 8px 22px;
-        margin-top: 14px;
-        padding-top: 12px;
-        border-top: 1px solid var(--line);
+        justify-content: space-between;
+        gap: 6px 18px;
+        margin: 0 0 14px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid var(--rule);
         color: var(--muted);
-        font-size: 13px;
+        font-size: 13.5px;
       }
-      .sb-stat b {
+      .sb-when {
         color: var(--ink);
+        font-variant-numeric: tabular-nums;
+      }
+      .sb-meta {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+      }
+      .sb-dur {
+        color: var(--ink);
+        font-variant-numeric: tabular-nums;
+      }
+      .sb-score {
+        color: var(--ink);
+        font-family: var(--font-sans);
+        font-size: 15px;
+        font-weight: 700;
         font-variant-numeric: tabular-nums;
       }
       .sb-winner {

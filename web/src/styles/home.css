@@ -209,16 +209,6 @@
   white-space: nowrap;
 }
 
-.home figcaption {
-  margin-top: 12px;
-  color: var(--muted);
-  font-size: 13.5px;
-  line-height: 1.55;
-}
-.home figcaption b {
-  color: var(--ink);
-}
-
 /* Chapter 2: Figures 1-3. Each card is a column (square map, then caption), so
    paired cards keep their maps level and their captions start on one line. */
 
