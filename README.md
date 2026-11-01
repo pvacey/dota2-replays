@@ -8,10 +8,10 @@ casts, damage, disables, deaths and smokes on every replay packet of the fight.
 - **Backend** — `backend/server.py`, stdlib-only HTTP server. Serves the app
   at `/`, the `/api` and `/data` endpoints, and manages a single-worker parse
   queue (download → decompress → export).
-- **Exporter** — `pipeline/export_match.py`, the slim app-only exporter. Reads
-  a `.dem` file and writes `fight.json` (the biggest fight's playback),
-  `fights/index.json` + `fights/N.json` (every fight), and
-  `figures/map.webp` + `figures/fights/N.webp` (map crops).
+- **Exporter** — `pipeline/export_match.py`. Reads a `.dem` file and writes
+  `fight.json` (the biggest fight's playback), `fights/index.json` +
+  `fights/N.json` (every fight), and `figures/map.webp` +
+  `figures/fights/N.webp` (map crops).
 - **Frontend** — `web/`, an Astro app built with bun; the server serves
   `web/dist` as static files.
 - **Data** — `data/` is generated, not committed. Hero/item icons and the 7.41
@@ -32,8 +32,8 @@ Backend serves on `$PASEO_PORT` (default 8000).
 
 ## Development
 
-Python 3.11 via [uv](https://docs.astral.sh/uv/), exact deps pinned. Paths for
-local data are relative to the repo root.
+Python 3.11 via [uv](https://docs.astral.sh/uv/). Paths for local data are
+relative to the repo root.
 
 ```bash
 uv sync                      # python deps + .venv
