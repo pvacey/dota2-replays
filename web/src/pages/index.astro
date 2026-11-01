@@ -22,13 +22,16 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Replays — app | gem</title>
+    <title>Barbaric Replays</title>
   </head>
   <body>
     <div class="app">
+      <header class="app-head">
+        <h1>Simply Barbaric.</h1>
+      </header>
       <aside class="app-side" aria-label="Matches">
         <div class="app-side-head">
-          <h1>Matches</h1>
+          <h2>Matches</h2>
           <button type="button" class="app-refresh" data-refresh aria-label="Refresh the match list">↻</button>
         </div>
         <p class="app-note" data-list-note>Loading matches…</p>
@@ -510,6 +513,19 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         margin: 0 auto;
         padding: 28px 28px 80px;
       }
+      .app-head {
+        grid-column: 1 / -1;
+        padding-bottom: 18px;
+        border-bottom: 1px solid var(--rule);
+      }
+      .app-head h1 {
+        margin: 0;
+        color: var(--ink);
+        font-family: var(--font-serif);
+        font-size: 34px;
+        font-weight: 450;
+        letter-spacing: -0.02em;
+      }
       .app-side {
         position: sticky;
         top: 28px;
@@ -526,7 +542,7 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         padding-bottom: 10px;
         border-bottom: 1px solid var(--rule);
       }
-      .app-side h1 {
+      .app-side h2 {
         margin: 0;
         color: var(--ink);
         font-family: var(--font-serif);

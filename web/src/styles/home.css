@@ -42,6 +42,7 @@
   font-family: var(--font-serif);
   font-size: 76px;
   font-weight: 450;
+  font-style: italic;
   font-variation-settings: "opsz" 60;
   line-height: 0.98;
   letter-spacing: -0.02em;
