@@ -256,6 +256,7 @@ def map_scoreboard(raw: dict) -> dict:
         }
         (radiant if p.get("isRadiant") else dire).append(entry)
     return {
+        "start_time": raw.get("start_time"),
         "duration_s": raw.get("duration"),
         "radiant_win": raw.get("radiant_win"),
         "radiant_score": raw.get("radiant_score"),
