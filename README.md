@@ -1,4 +1,4 @@
-# replays
+# Dota2 Replay Viewer
 
 Self-hosted viewer for Dota 2 team fights. Parses official replays with
 [gem](https://pypi.org/project/gem-dota/), stores per-match fight data, and
