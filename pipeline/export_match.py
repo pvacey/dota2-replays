@@ -272,6 +272,45 @@ def fight_box(match: ParsedMatch, fight: Fight, states: dict[int, list[HeroState
     return _crop([p for p in readings if math.dist(p, centre) <= FIGHT_RADIUS] + [centre])
 
 
+def items_recipe(match: ParsedMatch) -> dict | None:
+    """Per-player item purchase lanes (the items recipe's data).
+
+    ``items`` are ``[t, name, display, count]`` ``t`` in openDota-style game
+    seconds (negative pre-horn), ``name`` the icon key (the ``item_`` name
+    without the prefix), ``display`` the readable name, and ``count`` the
+    consecutive stacked purchases of the same item (deduplicated runs).
+    """
+    players = sorted(match.players, key=lambda p: p.player_id)
+    lanes = []
+    for player in players:
+        items: list[list] = []
+        for entry in player.purchase_log:
+            name = entry.value_name.removeprefix("item_")
+            if entry.game_time_s is None:
+                continue
+            if items and items[-1][1] == name:
+                items[-1][3] += 1
+                continue
+            items.append([round(entry.game_time_s, 1), name, item_display(entry.value_name), 1])
+        lanes.append(
+            {
+                "slot": player.player_id,
+                "team": TEAMS.get(player.team, "unknown"),
+                "name": player.player_name,
+                "hero": hero_display(player.hero_name),
+                "icon": player.hero_name.removeprefix("npc_dota_hero_"),
+                "items": items,
+            }
+        )
+    end_tick = match.post_game_tick or match.game_end_tick or 0
+    return {
+        # The axis runs like the fights index's: -90 s to the game's end.
+        "start_s": -90.0,
+        "end_s": round(_game_seconds(match, end_tick), 1),
+        "players": lanes,
+    }
+
+
 def fights_recipe(
     match: ParsedMatch, files: dict[int, str], boxes: dict[int, list[float]]
 ) -> list[dict]:
@@ -809,6 +848,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fight-data", type=Path, required=True)
     parser.add_argument("--fights-data", type=Path, required=True)
     parser.add_argument("--public-figures", type=Path, required=True)
+    parser.add_argument("--items-data", type=Path, help="write the per-player item lanes here")
     args = parser.parse_args(argv)
 
     match = load_match(args.replay)
@@ -866,6 +906,12 @@ def main(argv: list[str] | None = None) -> int:
     (args.fights_data / "index.json").write_text(json.dumps(index, separators=(",", ":")) + "\n")
     written.append(args.fights_data)
 
+    if args.items_data is not None:
+        args.items_data.parent.mkdir(parents=True, exist_ok=True)
+        args.items_data.write_text(
+            json.dumps(items_recipe(match), separators=(",", ":")) + "\n"
+        )
+        written.append(args.items_data)
     write_map_image(args.public_figures / "map.webp", px=1000, webp=True)
     written.append(args.public_figures)
     print("Wrote " + ", ".join(str(path) for path in written))
