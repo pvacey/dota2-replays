@@ -2,8 +2,9 @@
 
 `data/` is not committed. This script fills it from reproducible sources:
 
-- `data/heroes.json` — copied from the installed `gem` wheel (its own
-  catalog JSONs; keep `gem-dota==0.14.0` pinned so the copy is stable);
+- `data/heroes.json` + `data/items.json` — copied from the installed `gem`
+  wheel (its own catalog JSONs; keep `gem-dota==0.14.0` pinned so the copies
+  are stable);
 - `data/icons/heroes/*.png` and `data/icons/items/*.png` — downloaded from
   the Dota 2 CDN (same URL patterns as gem's `scripts/_icons.py`), named
   from the wheel's `heroes.json` / `items.json`;
@@ -56,12 +57,13 @@ def _wheel_json(name: str) -> dict:
 
 
 def catalog_jsons(*, force: bool) -> None:
-    """The wheel's catalog JSONs we read directly (currently just heroes.json)."""
-    target = DATA / "heroes.json"
-    if target.exists() and not force:
-        return
-    DATA.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(resources.files("gem").joinpath("data/heroes.json"), target)
+    """The wheel's catalog JSONs the backend reads (heroes and items)."""
+    for name in ("heroes.json", "items.json"):
+        target = DATA / name
+        if target.exists() and not force:
+            continue
+        DATA.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(resources.files("gem").joinpath(f"data/{name}"), target)
 
 
 def _shorts(json_name: str, *, prefix: str) -> list[str]:
