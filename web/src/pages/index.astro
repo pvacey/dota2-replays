@@ -143,10 +143,32 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       const $ = <T extends Element>(sel: string) => document.querySelector<T>(sel)!;
       const listEl = $<HTMLUListElement>("[data-matches]");
       const listNote = $<HTMLParagraphElement>("[data-list-note]");
+      const mainEl = $<HTMLElement>(".app-main");
       const scoreboardEl = $<HTMLElement>("[data-scoreboard]");
       const bodyEl = $<HTMLElement>("[data-body]");
       const figureTpl = $<HTMLTemplateElement>("#fights-fig-tpl");
       $<HTMLButtonElement>("[data-refresh]").addEventListener("click", () => void loadList());
+
+      // A match switch dims the view it is replacing rather than clearing it:
+      // the old content stays until the new one has been fetched and built, and
+      // then both go in together (one paint, no blank frame). The dim waits for
+      // the load to be slow enough to read as waiting — a match already in hand
+      // swaps before it ever shows.
+      let dimTimer: ReturnType<typeof setTimeout> | null = null;
+      const beginSwap = (): void => {
+        if (dimTimer !== null) return;
+        dimTimer = setTimeout(() => {
+          dimTimer = null;
+          mainEl.classList.add("is-swapping");
+        }, 150);
+      };
+      const endSwap = (): void => {
+        if (dimTimer !== null) {
+          clearTimeout(dimTimer);
+          dimTimer = null;
+        }
+        mainEl.classList.remove("is-swapping");
+      };
 
       // Two sequence tokens: the list (refresh) and the selection (parse poll,
       // figure load) evolve independently; stale responses are dropped.
@@ -166,8 +188,9 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       // --- The match list ---
 
       function stateHtml(state: RowState | undefined): string {
-        if (state === true) return `<span class="match-done">✓ parsed</span>`;
-        if (state === false) return `<span class="match-todo">not parsed</span>`;
+        if (state === true)
+          return `<span class="match-done" role="img" aria-label="parsed" title="parsed">✓</span>`;
+        if (state === false) return ``;
         if (state === "error") return `<span class="match-state-err" title="state unknown">—</span>`;
         return `<span class="spinner" role="status" aria-label="Checking"></span>`;
       }
@@ -282,13 +305,19 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
 
       // --- The selected match: scoreboard + body ---
 
+      // Nodes built outside the document, swapped in together by the caller.
+      interface Swap {
+        nodes: Node[];
+        /** Mounts that measure their own box: run right after the swap. */
+        mounts: Array<() => void>;
+      }
+      type Mount = () => void;
+
       async function loadMatch(id: number): Promise<void> {
         const ticket = ++matchSeq;
         itemsAbort?.abort();
         itemsAbort = null;
-        scoreboardEl.hidden = true;
-        scoreboardEl.replaceChildren();
-        bodyEl.replaceChildren(note("Loading match…"));
+        beginSwap();
         let info: MatchInfo;
         try {
           const res = await fetch(`/api/matches/${id}?${bust()}`);
@@ -296,21 +325,44 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
           info = (await res.json()) as MatchInfo;
         } catch (err) {
           if (ticket !== matchSeq) return;
+          endSwap();
+          currentBoard = null;
+          cardSel = null;
+          scoreboardEl.hidden = true;
+          scoreboardEl.replaceChildren();
           bodyEl.replaceChildren(note(`Could not load match ${id}: ${(err as Error).message}`));
           return;
         }
         if (ticket !== matchSeq) return;
         rowStates.set(id, info.parsed);
         updateRowState(id);
-        renderScoreboard(info);
-        await showMatchBody(id, info);
+        // Nothing here touches the page: the scoreboard and the body are built
+        // complete, then replace the old ones in one go.
+        const board = scoreboardNodes(info);
+        let body: Swap | null;
+        try {
+          body = await bodySwap(id, info, ticket);
+        } catch (err) {
+          if (ticket !== matchSeq) return;
+          endSwap();
+          bodyEl.replaceChildren(note(`Could not load match ${id}: ${(err as Error).message}`));
+          return;
+        }
+        if (ticket !== matchSeq || !body) return;
+        endSwap();
+        currentBoard = info.scoreboard;
+        cardSel = null;
+        scoreboardEl.hidden = board.length === 0;
+        scoreboardEl.replaceChildren(...board);
+        bodyEl.replaceChildren(...body.nodes);
+        for (const mount of body.mounts) mount();
       }
 
       function teamTable(side: "radiant" | "dire", rows: PlayerRow[], winner: boolean, kills: number): string {
         const cells = (p: PlayerRow, i: number) =>
           `<tr data-side="${side}" data-i="${i}" role="button" tabindex="0" aria-pressed="false" aria-label="Full match stats for ${text(p.player)}">` +
           `<td class="sb-player">${text(p.player)}</td>` +
-          `<td class="sb-hero"><img class="sb-icon sb-icon--${side}" src="/data/icons/heroes/${text(p.hero_icon)}.png" alt="" width="26" height="26" loading="lazy"><span>${text(p.hero)}</span></td>` +
+          `<td class="sb-hero"><img class="sb-icon sb-icon--${side}" src="/data/icons/heroes/${text(p.hero_icon)}.png" alt="" width="24" height="24" loading="lazy"><span>${text(p.hero)}</span></td>` +
           `<td class="num">${p.kills}</td><td class="num">${p.deaths}</td><td class="num">${p.assists}</td>` +
           `<td class="num">${gold(p.net_worth)}</td><td class="num">${p.level}</td><td class="num">${p.gpm}</td><td class="num">${gold(p.hero_damage)}</td>` +
           `</tr>`;
@@ -319,7 +371,12 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
           `<h2 class="sb-head sb-head--${side}">${side === "radiant" ? "Radiant" : "Dire"}` +
           `<span class="sb-score">${kills}</span>` +
           `${winner ? `<span class="sb-winner">Winner</span>` : ""}</h2>` +
-          `<table class="sb-table"><thead><tr>` +
+          `<table class="sb-table">` +
+          `<colgroup>` +
+          `<col class="sb-col sb-col--name"><col class="sb-col sb-col--hero">` +
+          `<col class="sb-col sb-col--k"><col class="sb-col sb-col--d"><col class="sb-col sb-col--a">` +
+          `<col class="sb-col sb-col--net"><col class="sb-col sb-col--lvl"><col class="sb-col sb-col--gpm"><col class="sb-col sb-col--dmg">` +
+          `</colgroup><thead><tr>` +
           `<th>Player</th><th>Hero</th><th class="num">K</th><th class="num">D</th><th class="num">A</th>` +
           `<th class="num">Net</th><th class="num">Lvl</th><th class="num">GPM</th><th class="num">Dmg</th>` +
           `</tr></thead><tbody>${rows.map((p, i) => cells(p, i)).join("")}</tbody></table>` +
@@ -345,19 +402,20 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       let currentBoard: Scoreboard | null = null;
       let cardSel: { side: "radiant" | "dire"; i: number } | null = null;
 
-      function renderScoreboard(info: MatchInfo): void {
+      // The scoreboard's markup, built inert: the reader keeps the board they
+      // are looking at until this one is swapped in (see loadMatch).
+      function scoreboardNodes(info: MatchInfo): Node[] {
         const sb = info.scoreboard;
-        currentBoard = sb;
-        cardSel = null;
         if (!sb) {
-          if (!info.scoreboard_error) return;
-          scoreboardEl.hidden = false;
-          scoreboardEl.innerHTML = `<p class="sb-error">${text(info.scoreboard_error)}</p>`;
-          return;
+          if (!info.scoreboard_error) return [];
+          const tpl = document.createElement("template");
+          tpl.innerHTML = `<p class="sb-error"></p>`;
+          tpl.content.firstElementChild!.textContent = info.scoreboard_error;
+          return [...tpl.content.childNodes];
         }
         const when = whenLabel(sb.start_time);
-        scoreboardEl.hidden = false;
-        scoreboardEl.innerHTML =
+        const tpl = document.createElement("template");
+        tpl.innerHTML =
           `<div class="sb-bar">` +
           `<span class="sb-when">${text(when ? `${when} - Match ${info.match_id}` : `Match ${info.match_id}`)}</span>` +
           `<span class="sb-meta">` +
@@ -370,6 +428,7 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
           teamTable("dire", sb.dire, !sb.radiant_win, sb.dire_score) +
           `</div>` +
           `<div class="sb-card" data-card hidden></div>`;
+        return [...tpl.content.childNodes];
       }
 
       // --- The player card: full match stats and the final build ---
@@ -494,8 +553,9 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       function syncTabs(list: Element | null): void {
         if (!list) return;
         const [fightsTab, itemsTab] = list.querySelectorAll<HTMLButtonElement>(".app-tab");
-        const fightsPane = list.nextElementSibling as HTMLElement;
-        const itemsPane = fightsPane.nextElementSibling as HTMLElement;
+        const fightsPane = list.nextElementSibling as HTMLElement | null;
+        const itemsPane = fightsPane?.nextElementSibling as HTMLElement | null;
+        if (!fightsPane || !itemsPane) return;
         for (const [btn, view] of [[fightsTab, "fights"], [itemsTab, "items"]] as const) {
           btn?.setAttribute("aria-selected", String(view === tabView));
         }
@@ -503,83 +563,103 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         itemsPane.hidden = tabView !== "items";
       }
 
-      async function showMatchBody(id: number, info: MatchInfo): Promise<void> {
-        const ticket = matchSeq;
+      // The tab bar and its two panes are built off the page; the pane the
+      // reader is looking at has to be complete before any of it shows, the
+      // other keeps loading into its (hidden) pane afterwards.
+      async function bodySwap(id: number, info: MatchInfo, ticket: number): Promise<Swap | null> {
         const tablist = document.createElement("div");
         tablist.className = "app-tablist";
         tablist.setAttribute("role", "tablist");
         tablist.append(tabButton("fights", "Fights"), tabButton("items", "Items"));
         const fightsPane = document.createElement("div");
         const itemsPane = document.createElement("div");
-        bodyEl.replaceChildren(tablist, fightsPane, itemsPane);
+        // Siblings first: syncTabs walks from the tab bar to its panes. They are
+        // attached together, still off the page.
+        document.createDocumentFragment().append(tablist, fightsPane, itemsPane);
         syncTabs(tablist);
-        if (info.parsed) void showFigure(id, fightsPane, ticket);
-        else showUnparsed(id, info, fightsPane);
-        void loadItems(id, info, itemsPane, ticket);
+        const fights: Promise<Mount | null> = info.parsed
+          ? figureMount(id, fightsPane, ticket)
+          : Promise.resolve(() => showUnparsed(id, info, fightsPane));
+        const items = itemsMount(id, info, itemsPane, ticket);
+        const onScreen = tabView === "items" ? items : fights;
+        if (onScreen === fights) itemsPane.replaceChildren(note("Loading item timelines…"));
+        else if (info.parsed) fightsPane.replaceChildren(note("Loading fights…"));
+        const first = await onScreen;
+        if (ticket !== matchSeq) return null;
+        const mounts: Mount[] = first ? [first] : [];
+        // The hidden tab finishes in the background: whatever it becomes, the
+        // reader never watches it arrive.
+        void (onScreen === fights ? items : fights).then(
+          (mount) => {
+            if (mount && ticket === matchSeq) mount();
+          },
+          () => {},
+        );
+        return { nodes: [tablist, fightsPane, itemsPane], mounts };
       }
 
-      async function showFigure(id: number, pane: HTMLElement, ticket: number): Promise<void> {
-        pane.replaceChildren(note("Loading fights…"));
+      async function figureMount(id: number, pane: HTMLElement, ticket: number): Promise<Mount | null> {
         let index: FightsData;
         try {
           const res = await fetch(`/data/matches/${id}/fights/index.json`);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           index = (await res.json()) as FightsData;
         } catch (err) {
-          if (ticket !== matchSeq) return;
-          pane.replaceChildren(note(`Could not load the fights: ${(err as Error).message}`));
-          return;
+          if (ticket !== matchSeq) return null;
+          const msg = (err as Error).message;
+          return () => pane.replaceChildren(note(`Could not load the fights: ${msg}`));
         }
-        if (ticket !== matchSeq) return;
+        if (ticket !== matchSeq) return null;
         const [{ mountFightsFigure }, { fightDots }] = await Promise.all([
           import("../lib/fights-figure"),
           import("../lib/fights-data"),
         ]);
-        if (ticket !== matchSeq) return;
-        const figure = figureTpl.content.firstElementChild!.cloneNode(true) as HTMLElement;
-        const assets = `/data/matches/${id}/figures/`;
-        figure.dataset.assets = assets;
-        figure.querySelector("image")!.setAttribute("href", `${assets}map.webp`);
-        figure.querySelector<SVGGElement>("[data-fights]")!.innerHTML = fightDots(index.fights);
-        const head = document.createElement("div");
-        head.className = "fights-head";
-        head.innerHTML =
-          `<h2>Fights on the map</h2>` +
-          `<p>Every fight in this match is a dot on the map. Bigger dots mean more deaths; the color shows which team got more kills in that fight. Click a dot or a row in the fight list to open that fight's breakdown below.</p>`;
-        pane.replaceChildren(head, figure);
-        mountFightsFigure(figure, index, {
-          loadFight: (file) =>
-            fetch(`/data/matches/${id}/${file}`)
-              .then((r) => r.json())
-              .then((j) => ({ default: j as FightData })),
-          icons: null,
-        });
+        if (ticket !== matchSeq) return null;
+        return () => {
+          const figure = figureTpl.content.firstElementChild!.cloneNode(true) as HTMLElement;
+          const assets = `/data/matches/${id}/figures/`;
+          figure.dataset.assets = assets;
+          figure.querySelector("image")!.setAttribute("href", `${assets}map.webp`);
+          figure.querySelector<SVGGElement>("[data-fights]")!.innerHTML = fightDots(index.fights);
+          const head = document.createElement("div");
+          head.className = "fights-head";
+          head.innerHTML =
+            `<h2>Fights on the map</h2>` +
+            `<p>Every fight in this match is a dot on the map. Bigger dots mean more deaths; the color shows which team got more kills in that fight. Click a dot or a row in the fight list to open that fight's breakdown below.</p>`;
+          pane.replaceChildren(head, figure);
+          mountFightsFigure(figure, index, {
+            loadFight: (file) =>
+              fetch(`/data/matches/${id}/${file}`)
+                .then((r) => r.json())
+                .then((j) => ({ default: j as FightData })),
+            icons: null,
+          });
+        };
       }
 
-      async function loadItems(id: number, info: MatchInfo, pane: HTMLElement, ticket: number): Promise<void> {
+      async function itemsMount(id: number, info: MatchInfo, pane: HTMLElement, ticket: number): Promise<Mount | null> {
         itemsAbort?.abort();
         const abort = new AbortController();
         itemsAbort = abort;
-        pane.replaceChildren(note("Loading item timelines…"));
+        const stale = () => ticket !== matchSeq || abort.signal.aborted;
         let data: ItemLanesData;
         try {
           const res = await fetch(`/data/matches/${id}/items.json`, { signal: abort.signal });
           if (res.status === 404) {
-            if (ticket !== matchSeq || abort.signal.aborted) return;
-            showItemsMissing(id, info, pane);
-            return;
+            if (stale()) return null;
+            return () => showItemsMissing(id, info, pane);
           }
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           data = (await res.json()) as ItemLanesData;
         } catch (err) {
-          if (ticket !== matchSeq || abort.signal.aborted) return;
-          pane.replaceChildren(errorNote(`Could not load the item timelines: ${(err as Error).message}`));
-          return;
+          if (stale()) return null;
+          const msg = (err as Error).message;
+          return () => pane.replaceChildren(errorNote(`Could not load the item timelines: ${msg}`));
         }
-        if (ticket !== matchSeq || abort.signal.aborted) return;
+        if (stale()) return null;
         const { mountItems } = await import("../lib/items-lanes");
-        if (ticket !== matchSeq || abort.signal.aborted) return;
-        mountItems(pane, data);
+        if (stale()) return null;
+        return () => mountItems(pane, data);
       }
 
       function showItemsMissing(id: number, info: MatchInfo, pane: HTMLElement): void {
@@ -723,7 +803,7 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       /* The app chrome, over the site's tokens. */
       .app {
         display: grid;
-        grid-template-columns: 260px minmax(0, 1fr);
+        grid-template-columns: 200px minmax(0, 1fr);
         gap: 40px;
         max-width: 1400px;
         margin: 0 auto;
@@ -800,6 +880,22 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         overflow-y: auto;
         list-style: none;
         font-size: 13.5px;
+        scrollbar-width: thin;
+        scrollbar-color: color-mix(in srgb, var(--muted) 30%, transparent)
+          transparent;
+      }
+      .match-list::-webkit-scrollbar {
+        width: 6px;
+      }
+      .match-list::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      .match-list::-webkit-scrollbar-thumb {
+        border-radius: 999px;
+        background: color-mix(in srgb, var(--muted) 30%, transparent);
+      }
+      .match-list::-webkit-scrollbar-thumb:hover {
+        background: color-mix(in srgb, var(--muted) 55%, transparent);
       }
       .match-row {
         display: block;
@@ -841,15 +937,24 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         font-size: 11.5px;
         white-space: nowrap;
       }
-      .match-done {
-        color: var(--accent);
-      }
-      .match-todo {
-        color: var(--muted);
-      }
-
       .app-main {
         min-width: 0;
+      }
+
+      /* A match switch: the view being replaced dims and stops taking clicks
+         while the next one is fetched; it is swapped in whole, so nothing
+         blinks to empty in between. */
+      .app-main :is(.scoreboard, .app-body) {
+        transition: opacity 0.12s ease-out;
+      }
+      .app-main.is-swapping :is(.scoreboard, .app-body) {
+        opacity: 0.45;
+        pointer-events: none;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .app-main :is(.scoreboard, .app-body) {
+          transition: none;
+        }
       }
 
       /* Scoreboard */
@@ -860,6 +965,9 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 28px;
+      }
+      .sb-team {
+        min-width: 0;
       }
       .sb-head {
         display: flex;
@@ -885,13 +993,38 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       .sb-head--dire::before {
         background: var(--map-dire-mark);
       }
+      /* Fixed columns: every board's column boundaries sit in the same spot no
+         matter what the data under them says. Text and numbers clip instead of
+         pushing the columns around. */
       .sb-table {
+        table-layout: fixed;
         width: 100%;
         border-collapse: collapse;
         font-size: 13px;
       }
+      .sb-col--name {
+        width: 17%;
+      }
+      .sb-col--hero {
+        width: 28%;
+      }
+      .sb-col--k,
+      .sb-col--d,
+      .sb-col--a,
+      .sb-col--lvl {
+        width: 7%;
+      }
+      .sb-col--net {
+        width: 10%;
+      }
+      .sb-col--gpm {
+        width: 8%;
+      }
+      .sb-col--dmg {
+        width: 9%;
+      }
       .sb-table th {
-        padding: 4px 6px;
+        padding: 4px 5px;
         border-bottom: 1px solid var(--line);
         color: var(--muted);
         font-size: 10.5px;
@@ -902,7 +1035,7 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         white-space: nowrap;
       }
       .sb-table td {
-        padding: 5px 6px;
+        padding: 4px 5px;
         border-bottom: 1px solid var(--line);
         color: var(--ink);
         white-space: nowrap;
@@ -913,27 +1046,26 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         font-variant-numeric: tabular-nums;
       }
       .sb-player {
-        max-width: 96px;
         overflow: hidden;
         color: var(--body);
         text-overflow: ellipsis;
       }
       .sb-hero {
-        max-width: 176px;
         overflow: hidden;
       }
       .sb-hero span {
+        /* The hero icon (24px + its 6px margin) sits aside of it. */
         display: inline-block;
-        max-width: 134px;
+        max-width: calc(100% - 30px);
         overflow: hidden;
         text-overflow: ellipsis;
         vertical-align: middle;
         white-space: nowrap;
       }
       .sb-icon {
-        width: 26px;
-        height: 26px;
-        margin-right: 7px;
+        width: 24px;
+        height: 24px;
+        margin-right: 6px;
         border: 1.5px solid;
         border-radius: 50%;
         object-fit: cover;
@@ -1116,11 +1248,16 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         border-color: var(--accent);
       }
 
-      /* The unparsed panel and the parse progress */
+      /* The unparsed panel is the same full-width card the fights figure is: a
+         parsed match and an unparsed one keep the same content width, and the
+         same left edge, when the reader switches between them. */
       .parse-panel {
-        max-width: 620px;
-        margin: 56px auto;
-        text-align: center;
+        margin: 0;
+        padding: 16px;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: var(--paper);
+        box-shadow: var(--shadow);
       }
       .parse-panel h2 {
         margin: 0 0 10px;
@@ -1130,12 +1267,11 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         font-weight: 450;
       }
       .parse-panel .app-note {
-        max-width: 480px;
-        margin: 0 auto 18px;
+        max-width: 720px;
+        margin: 0 0 18px;
       }
       .parse-panel [data-parse-view] {
-        margin-top: 22px;
-        text-align: left;
+        margin-top: 18px;
       }
       .parse-bar {
         height: 8px;
@@ -1439,6 +1575,16 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         grid-template-columns: minmax(0, 1fr);
       }
 
+      /* Two boards side by side only fit once the main column is at its
+         full width (viewport >= 1400px, sidebar included). Narrower than
+         that — square-ish windows especially — the half-width tracks are
+         smaller than a table's minimum and the text collides, so stack. */
+      @media (max-width: 1399px) {
+        .sb-teams {
+          grid-template-columns: minmax(0, 1fr);
+        }
+      }
+
       @media (max-width: 900px) {
         .app {
           grid-template-columns: minmax(0, 1fr);
@@ -1448,9 +1594,6 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         .app-side {
           position: static;
           max-height: 340px;
-        }
-        .sb-teams {
-          grid-template-columns: minmax(0, 1fr);
         }
       }
     </style>
