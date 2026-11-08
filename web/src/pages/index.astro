@@ -1003,10 +1003,10 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         font-size: 13px;
       }
       .sb-col--name {
-        width: 17%;
+        width: 20%;
       }
       .sb-col--hero {
-        width: 28%;
+        width: 25%;
       }
       .sb-col--k,
       .sb-col--d,
@@ -1140,9 +1140,11 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       .sb-table tr[data-side] {
         cursor: pointer;
       }
-      .sb-table tr[data-side]:hover td,
+      .sb-table tr[data-side]:hover td {
+        background: color-mix(in srgb, var(--accent-soft) 30%, transparent);
+      }
       .sb-table tr[data-side][aria-pressed="true"] td {
-        background: var(--accent-soft);
+        background: color-mix(in srgb, var(--accent-soft) 55%, transparent);
       }
       .sb-table tr[data-side]:focus-visible {
         outline: 2px solid var(--accent);
