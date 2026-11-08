@@ -78,6 +78,11 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         match_id: number;
         /** Squad account ids on file for this match (empty when unknown). */
         account_ids?: number[];
+        /** Our team's lineup: [a: account id, h: hero icon key], when the
+         * cached scoreboard has it. */
+        lineup?: { a: number | null; h: string | null }[];
+        /** Whether our side won, when the cached scoreboard says. */
+        win?: boolean | null;
         latest_timestamp: string;
       }
       interface PlayerEntry {
@@ -240,17 +245,20 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         updateRowState(id);
       }
 
-      // Five dots per row: one per teammate, solid for the ones on file in
-      // ClickHouse. Matches outside ClickHouse's recent window have no id
-      // data (no account_ids), so they go without dots.
-      function squadDots(m: MatchListItem): string {
-        const ids = m.account_ids;
-        if (ids === undefined) return "";
-        const inMatch = Math.min(ids.length, 5);
-        const label = `${inMatch}/5 squad in this match`;
-        return `<span class="match-dots" title="${text(label)}" aria-label="${text(label)}">` +
-          Array.from({ length: 5 }, (_, i) => `<i class="match-dot${i < inMatch ? " match-dot--solid" : ""}"></i>`).join("") +
-          `</span>`;
+      // Our team's five hero portraits: the squad members wear their full
+      // color, the teammates who aren't squad come in grayscale, and the
+      // player picked in the filter (when one is) gets a ring. Matches
+      // without a cached lineup (no scoreboards yet) go without portraits.
+      function teamPortraits(m: MatchListItem): string {
+        return (m.lineup ?? [])
+          .map((p) => {
+            if (p.h === null || p.h === undefined)
+              return `<span class="match-avatar match-avatar--empty"></span>`;
+            const picked = filterPlayer !== null && p.a === filterPlayer;
+            return `<img class="match-avatar${p.a === null || !squadPlayers.has(p.a) ? " match-avatar--other" : ""}${picked ? " match-avatar--picked" : ""}" ` +
+              `src="/data/icons/heroes/${text(p.h)}.png" alt="" width="24" height="24" loading="lazy">`;
+          })
+          .join("");
       }
 
       function rowFor(m: MatchListItem, shared = false): HTMLLIElement {
@@ -263,10 +271,14 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         const li = document.createElement("li");
         const hit = filterPlayer !== null && !shared
           && (m.account_ids ?? []).includes(filterPlayer);
+        const won = m.lineup !== undefined && m.win === true;
+        const lost = m.lineup !== undefined && m.win === false;
         li.innerHTML =
-          `<button type="button" class="match-row${hit ? " match-row--hit" : ""}" data-match="${m.match_id}" aria-pressed="${String(m.match_id === selected)}">` +
-          `<span class="match-row-top"><span class="match-id">${m.match_id}</span>` +
-          squadDots(m) +
+          `<button type="button" class="match-row${hit ? " match-row--hit" : ""}" data-match="${m.match_id}" aria-pressed="${String(m.match_id === selected)}" title="Match ${m.match_id}">` +
+          `<span class="match-row-top">` +
+          (won ? `<span class="match-win match-win--w" role="img" aria-label="Won" title="Won"></span>` : "") +
+          (lost ? `<span class="match-win match-win--l" role="img" aria-label="Lost" title="Lost"></span>` : "") +
+          `<span class="match-team">${teamPortraits(m)}</span>` +
           `<span class="match-state" data-state>${stateHtml(rowStates.get(m.match_id))}</span></span>` +
           `<span class="match-date">${text(date)}</span>` +
           `</button>`;
@@ -987,24 +999,26 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         letter-spacing: -0.01em;
       }
       /* The player dropdown and its only/highlight toggle; 30px tall to line
-         up with the refresh button. */
+         up with the refresh button. Native selects repaint their own light
+         face on some platforms, so give both the control and its options the
+         theme's paper colors explicitly. */
       .app-player-filter {
         height: 30px;
         max-width: 104px;
         padding: 0 2px 0 8px;
         border: 1px solid var(--line);
         border-radius: 6px;
-        background: none;
-        color: var(--muted);
+        background-color: var(--bg);
+        color: var(--ink);
         font: inherit;
         font-size: 12.5px;
         cursor: pointer;
       }
       .app-player-filter:hover {
-        color: var(--ink);
         border-color: var(--rule);
       }
       .app-player-filter option {
+        background-color: var(--paper);
         color: var(--ink);
       }
       .app-only-toggle {
@@ -1092,11 +1106,11 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         text-align: left;
         cursor: pointer;
       }
-      /* A match with the filtered player: accent bar and a faint tint; the
-         hover/open state still reads over it. */
+      /* A match with the filtered player: a soft neutral wash only — the
+         accent is left to the player's ringed portrait; hover/open still
+         reads over the wash. */
       .match-row--hit {
-        box-shadow: inset 2px 0 0 var(--accent);
-        background: color-mix(in srgb, var(--accent) 8%, transparent);
+        background: color-mix(in srgb, var(--muted) 10%, transparent);
       }
       .match-row:hover,
       .match-row[aria-pressed="true"] {
@@ -1111,33 +1125,56 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         justify-content: space-between;
         gap: 8px;
       }
-      .match-id {
-        color: var(--ink);
-        font-family: var(--font-mono);
-        font-size: 12.5px;
-      }
-      /* Squad dots: solid = on file in ClickHouse, hollow = the rest of the
-         five-man row. They ride beside the match id with the parse state. */
-      .match-dots {
+      /* Our team's hero portraits: squad members in full color, teammates
+         who aren't squad in grayscale. They fill the width the old match id
+         occupied and stand out against the parse state. */
+      .match-team {
         display: inline-flex;
-        gap: 3px;
+        gap: 4px;
         flex: 1;
-        justify-content: center;
-        overflow: hidden;
+        min-width: 0;
       }
-      .match-dot {
+      .match-avatar {
         display: block;
         flex: none;
-        width: 6px;
-        height: 6px;
-        border: 1px solid var(--muted);
+        width: 22px;
+        height: 22px;
         border-radius: 50%;
+        object-fit: cover;
+        background: var(--bg);
+      }
+      .match-avatar--other {
+        filter: grayscale(1);
         opacity: 0.55;
       }
-      .match-dot--solid {
-        border-color: var(--accent);
-        background: var(--accent);
+      /* The filtered player's portrait: a separated accent ring, and in case
+         a pick ever lands on a grayscale row, color it back in. */
+      .match-avatar--picked {
+        filter: none;
         opacity: 1;
+        margin: 0 2px;
+        box-shadow:
+          0 0 0 2px var(--bg),
+          0 0 0 3.5px var(--accent);
+      }
+      .match-avatar--empty {
+        border: 1px dashed var(--line);
+        background: none;
+      }
+      /* Whether our side won: a vertical bar leading the row, before the
+         portraits — green for a win, red for a loss, nothing for matches
+         we can't score (no cached board). */
+      .match-win {
+        flex: none;
+        width: 3px;
+        height: 22px;
+        border-radius: 2px;
+      }
+      .match-win--w {
+        background: var(--accent);
+      }
+      .match-win--l {
+        background: var(--danger);
       }
       .match-date {
         display: block;
