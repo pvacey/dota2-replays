@@ -39,9 +39,14 @@ CH_URL = os.environ.get(
 OD_URL = "https://api.opendota.com/api/matches/"
 USER_AGENT = "dota2-replays/1.0"
 SQL = (
-    "SELECT match_id, MAX(timestamp) AS latest_timestamp FROM dota_events "
-    "WHERE match_id != 0 GROUP BY match_id ORDER BY latest_timestamp DESC "
-    "LIMIT 25 FORMAT JSONEachRow"
+    # The recent window and the squad members (positive account ids) seen in
+    # it, in one shot: each row's account_ids drives the match list dots, and
+    # their union is the squad set the scoreboard highlights against.
+    "SELECT match_id, groupUniqArrayIf(account_id, account_id > 0) AS account_ids, "
+    "MAX(timestamp) AS latest_timestamp FROM dota_events "
+    "WHERE match_id != 0 AND match_id IN (SELECT match_id FROM dota_events "
+    "WHERE match_id != 0 GROUP BY match_id ORDER BY MAX(timestamp) DESC LIMIT 25) "
+    "GROUP BY match_id ORDER BY latest_timestamp DESC FORMAT JSONEachRow"
 )
 CHUNK = 65536
 MATCH_TTL_S = 30 * 86400
@@ -371,7 +376,7 @@ def enqueue(match_id: int, replay_url: str) -> None:
 # ---------------------------------------------------------------- handlers
 
 #: Bumped when the mapped board's shape changes; older caches refetch.
-SCOREBOARD_V = 2
+SCOREBOARD_V = 3
 
 
 def _item_slot(p: dict, key: str) -> list[str] | None:
@@ -401,6 +406,9 @@ def map_scoreboard(raw: dict) -> dict:
             "gpm": p.get("gold_per_min"),
             "xpm": p.get("xp_per_min"),
             "hero_damage": p.get("hero_damage"),
+            # Steam account id: the scoreboard and the player card highlight
+            # squad members (account ids on file in ClickHouse) with it.
+            "account_id": p.get("account_id"),
             # Final build: six inventory slots, three backpack, the neutral
             # item(s); each [icon key, display name] or None for an empty slot.
             "items": [_item_slot(p, f"item_{i}") for i in range(6)],
@@ -675,9 +683,20 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json(503, {"error": f"bad clickhouse response: {e}"})
             return
+        seen = {int(m["match_id"]) for m in matches if str(m.get("match_id", "")).isdigit()}
+        # Squad members on file for each match, and their union across the
+        # window (the set the scoreboard highlights against). Matches shown
+        # but outside ClickHouse have no id data -> no dots, no tints.
+        squad: set[int] = set()
+        for m in matches:
+            ids = sorted(
+                int(a) for a in (m.pop("account_ids", None) or [])
+                if str(a).lstrip("-").isdigit() and int(a) > 0
+            )
+            m["account_ids"] = ids
+            squad.update(ids)
         # Unparsed ClickHouse rows + anything already parsed locally, whether
         # or not ClickHouse still has it.
-        seen = {int(m["match_id"]) for m in matches if str(m.get("match_id", "")).isdigit()}
         fmt = "%Y-%m-%d %H:%M:%S"
         for mid in parsed_match_ids():
             if mid in seen:
@@ -685,10 +704,11 @@ class Handler(BaseHTTPRequestHandler):
             ts = match_timestamp(mid)
             matches.append({
                 "match_id": mid,
+                "account_ids": [],
                 "latest_timestamp": time.strftime(fmt, time.gmtime(ts)) if ts else "",
             })
         matches.sort(key=lambda m: str(m.get("latest_timestamp", "")), reverse=True)
-        self.send_json(200, {"matches": matches})
+        self.send_json(200, {"matches": matches, "players": sorted(squad)})
 
     def api_match(self, match_id: int) -> None:
         job = load_job(match_id)
