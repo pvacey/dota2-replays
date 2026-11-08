@@ -185,6 +185,48 @@ def parsed_match_ids() -> list[int]:
     return out
 
 
+def lineup_from_cache(match_id: int, ids: set[int]) -> tuple[list[dict], bool | None] | None:
+    """Our team's lineup for the match list portraits: [{a: account id, h:
+    hero icon key}] and whether our side won (None when the board doesn't
+    say), read straight from the cached scoreboard. Ours is the side with
+    more squad members on file; boards without account ids (or a tie between
+    the sides) don't get one, and boards without a cache get to rely on the
+    scoreboard fetch the row's parse-state check kicks off."""
+    path = MATCHES / str(match_id) / "scoreboard.json"
+    if not path.is_file():
+        return None
+    try:
+        board = json.loads(path.read_text())
+    except Exception:
+        return None
+    teams: list[list[dict]] = []
+    counts: list[int] = []
+    for key in ("radiant", "dire"):
+        rows = board.get(key) if isinstance(board, dict) else None
+        if not isinstance(rows, list):
+            return None
+        team = []
+        n = 0
+        for p in rows:
+            if not isinstance(p, dict):
+                return None
+            aid = p.get("account_id")
+            aid = aid if isinstance(aid, int) and aid > 0 else None
+            if aid is not None and aid in ids:
+                n += 1
+            icon = p.get("hero_icon")
+            team.append({"a": aid, "h": icon if isinstance(icon, str) else None})
+        teams.append(team)
+        counts.append(n)
+    if counts[0] == counts[1]:
+        return None
+    win: bool | None = None
+    radiant_win = board.get("radiant_win")
+    if isinstance(radiant_win, bool):
+        win = radiant_win if counts[0] > counts[1] else not radiant_win
+    return (teams[0] if counts[0] > counts[1] else teams[1]), win
+
+
 def match_timestamp(match_id: int) -> int | None:
     """Best-effort match start (epoch s) from the cached scoreboard."""
     path = MATCHES / str(match_id) / "scoreboard.json"
@@ -729,6 +771,9 @@ class Handler(BaseHTTPRequestHandler):
                 if str(a).lstrip("-").isdigit() and int(a) > 0
             )
             m["account_ids"] = ids
+            pulled = lineup_from_cache(int(m["match_id"]), set(ids))
+            m["lineup"] = None if pulled is None else pulled[0]
+            m["win"] = None if pulled is None else pulled[1]
             squad.update(ids)
         # Unparsed ClickHouse rows + anything already parsed locally, whether
         # or not ClickHouse still has it.
@@ -740,6 +785,8 @@ class Handler(BaseHTTPRequestHandler):
             matches.append({
                 "match_id": mid,
                 "account_ids": [],
+                "lineup": None,
+                "win": None,
                 "latest_timestamp": time.strftime(fmt, time.gmtime(ts)) if ts else "",
             })
         matches.sort(key=lambda m: str(m.get("latest_timestamp", "")), reverse=True)
