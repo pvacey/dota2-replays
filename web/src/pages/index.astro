@@ -32,6 +32,10 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       <aside class="app-side" aria-label="Matches">
         <div class="app-side-head">
           <h2>Matches</h2>
+          <select class="app-player-filter" data-player-filter aria-label="Filter matches by player">
+            <option value="">All players</option>
+          </select>
+          <button type="button" class="app-only-toggle" data-only hidden aria-pressed="false" title="Switch between highlighting matches with this player and showing only their matches">Only</button>
           <button type="button" class="app-refresh" data-refresh aria-label="Refresh the match list">↻</button>
         </div>
         <p class="app-note" data-list-note>Loading matches…</p>
@@ -75,6 +79,10 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         /** Squad account ids on file for this match (empty when unknown). */
         account_ids?: number[];
         latest_timestamp: string;
+      }
+      interface PlayerEntry {
+        account_id: number;
+        name: string;
       }
       interface PlayerRow {
         player: string;
@@ -125,9 +133,14 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       }
       type RowState = "fetching" | "error" | boolean;
 
-      // Squad members on file in ClickHouse's recent window: the account ids
-      // the scoreboard rows (which carry account_id) are tinted against.
-      let squadPlayers = new Set<number>();
+      // Squad members on file in ClickHouse's recent window (account id ->
+      // display name). The player filter narrows/highlights the match list;
+      // the scoreboard rows (which carry account_id) are tinted against it.
+      let squadPlayers = new Map<number, string>();
+      // The picked squad member and the mode of their filter: false marks
+      // every match with them, true shows only their matches.
+      let filterPlayer: number | null = null;
+      let filterOnly = false;
 
       const bust = () => `t=${Date.now()}`;
       const text = (s: string) =>
@@ -248,8 +261,10 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
             ? m.latest_timestamp
             : when.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
         const li = document.createElement("li");
+        const hit = filterPlayer !== null && !shared
+          && (m.account_ids ?? []).includes(filterPlayer);
         li.innerHTML =
-          `<button type="button" class="match-row" data-match="${m.match_id}" aria-pressed="${String(m.match_id === selected)}">` +
+          `<button type="button" class="match-row${hit ? " match-row--hit" : ""}" data-match="${m.match_id}" aria-pressed="${String(m.match_id === selected)}">` +
           `<span class="match-row-top"><span class="match-id">${m.match_id}</span>` +
           squadDots(m) +
           `<span class="match-state" data-state>${stateHtml(rowStates.get(m.match_id))}</span></span>` +
@@ -271,10 +286,10 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const body = (await res.json()) as {
             matches: MatchListItem[];
-            players: number[];
+            players: PlayerEntry[];
           };
           items = body.matches;
-          squadPlayers = new Set(body.players);
+          squadPlayers = new Map(body.players.map((p) => [p.account_id, p.name]));
         } catch (err) {
           if (ticket !== listSeq) return;
           const msg = `Could not load matches: ${(err as Error).message}`;
@@ -283,24 +298,48 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
           return;
         }
         if (ticket !== listSeq) return;
+        // The player filter: "only" mode keeps their matches; highlight mode
+        // keeps every row and lets rowFor mark theirs.
+        fillPlayerFilter();
+        const inFilter = (m: MatchListItem) =>
+          filterPlayer !== null && (m.account_ids ?? []).includes(filterPlayer);
+        const rows = items.filter((m) => !filterOnly || inFilter(m));
         listNote.hidden = true;
         listEl.hidden = false;
-        listEl.replaceChildren(...items.map((m) => rowFor(m)));
-        // A shared match outside the recent list rides along as an extra row.
-        if (selected !== null && !items.some((m) => m.match_id === selected)) {
-          listEl.prepend(rowFor({ match_id: selected, latest_timestamp: "" }, true));
-          if (!rowStates.has(selected)) void fillState(selected);
+        listEl.replaceChildren(...rows.map((m) => rowFor(m)));
+        // A shared match outside the recent list rides along as an extra row
+        // when the filter still shows it (in "only" mode an unknown match
+        // can't be confirmed as theirs, so it stays off).
+        if (selected !== null && !rows.some((m) => m.match_id === selected)) {
+          const unknownShared = !items.some((m) => m.match_id === selected);
+          if (!filterOnly && unknownShared) {
+            listEl.prepend(rowFor({ match_id: selected, latest_timestamp: "" }, true));
+            if (!rowStates.has(selected)) void fillState(selected);
+          } else if (rows.length > 0) {
+            selectMatch(rows[0].match_id);
+          } else {
+            matchSeq += 1;
+            stopPoll();
+            selected = null;
+            scoreboardEl.hidden = true;
+            scoreboardEl.replaceChildren();
+            bodyEl.replaceChildren(note(
+              `No matches on file with ${squadPlayers.get(filterPlayer!)}.`));
+          }
         }
-        for (const m of items) void fillState(m.match_id);
+        for (const m of rows) void fillState(m.match_id);
         if (selected !== null) return;
-        if (items.length === 0) {
+        if (rows.length === 0) {
           listEl.hidden = true;
           listNote.hidden = false;
-          listNote.textContent = "No matches yet.";
-          bodyEl.replaceChildren(note("No matches yet."));
+          listNote.textContent =
+            filterPlayer !== null
+              ? `No matches on file with ${squadPlayers.get(filterPlayer)}.`
+              : "No matches yet.";
+          bodyEl.replaceChildren(note(listNote.textContent));
           return;
         }
-        selectMatch(items[0].match_id);
+        selectMatch(rows[0].match_id);
       }
 
       // Shareable selection: read once on load, mirrored back on every change
@@ -317,6 +356,60 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         url.searchParams.set("m", `${id}`);
         history.replaceState(null, "", url);
       };
+
+      // The player filter is shareable too: ?p=<account id> picks one, ?o=1
+      // makes it view-only instead of highlighting.
+      const filterSel = $<HTMLSelectElement>("[data-player-filter]");
+      const onlyBtn = $<HTMLButtonElement>("[data-only]");
+      const syncOnlyChip = (): void => {
+        if (filterPlayer === null) {
+          onlyBtn.hidden = true;
+          return;
+        }
+        onlyBtn.hidden = false;
+        onlyBtn.setAttribute("aria-pressed", String(filterOnly));
+        onlyBtn.textContent = filterOnly ? "Only" : "Highlight";
+        onlyBtn.title = filterOnly
+          ? `Show every match again, with ${squadPlayers.get(filterPlayer)}'s marked`
+          : `Show only matches with ${squadPlayers.get(filterPlayer)}`;
+      };
+      const syncFilterUrl = (): void => {
+        const url = new URL(location.href);
+        if (filterPlayer === null) url.searchParams.delete("p");
+        else url.searchParams.set("p", `${filterPlayer}`);
+        if (filterOnly) url.searchParams.set("o", "1");
+        else url.searchParams.delete("o");
+        history.replaceState(null, "", url);
+      };
+      // Roster -> options; a picked player no longer on the roster resets to
+      // "All players".
+      function fillPlayerFilter(): void {
+        const current = filterPlayer;
+        filterSel.replaceChildren(
+          new Option("All players", ""),
+          ...[...squadPlayers.entries()]
+            .sort((a, b) => a[1].localeCompare(b[1]))
+            .map(([id, name]) => new Option(name, `${id}`)),
+        );
+        if (current !== null && !squadPlayers.has(current)) {
+          filterPlayer = null;
+          filterOnly = false;
+        }
+        filterSel.value = filterPlayer === null ? "" : `${filterPlayer}`;
+        syncOnlyChip();
+      }
+      filterSel.addEventListener("change", () => {
+        filterPlayer = filterSel.value === "" ? null : Number(filterSel.value);
+        filterOnly = false;
+        syncFilterUrl();
+        void loadList();
+      });
+      onlyBtn.addEventListener("click", () => {
+        filterOnly = !filterOnly;
+        syncOnlyChip();
+        syncFilterUrl();
+        void loadList();
+      });
 
       function selectMatch(id: number): void {
         if (id === selected) return;
@@ -826,8 +919,21 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       }
 
       // Auto-load: a shared ?m= selects immediately (the list fills in around
-      // it); otherwise wait for the list to know which match is newest.
+      // it) and a shared ?p= filters around that player; otherwise wait for
+      // the list to know which match is newest and who is playing.
       const initialId = paramId();
+      {
+        const raw = new URLSearchParams(location.search);
+        const rawP = raw.get("p");
+        if (rawP !== null && /^\d+$/.test(rawP)) {
+          const id = Number(rawP);
+          if (Number.isSafeInteger(id) && id > 0) {
+            filterPlayer = id;
+            filterOnly = raw.get("o") === "1";
+            syncOnlyChip();
+          }
+        }
+      }
       if (initialId !== null) selectMatch(initialId);
       void loadList();
     </script>
@@ -865,19 +971,64 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       }
       .app-side-head {
         display: flex;
-        align-items: baseline;
+        align-items: center;
         justify-content: space-between;
-        gap: 12px;
+        flex-wrap: wrap;
+        gap: 8px;
         padding-bottom: 10px;
         border-bottom: 1px solid var(--rule);
       }
-      .app-side h2 {
-        margin: 0;
+      .app-side-head h2 {
+        margin-right: auto;
         color: var(--ink);
         font-family: var(--font-serif);
         font-size: 24px;
         font-weight: 450;
         letter-spacing: -0.01em;
+      }
+      /* The player dropdown and its only/highlight toggle; 30px tall to line
+         up with the refresh button. */
+      .app-player-filter {
+        height: 30px;
+        max-width: 104px;
+        padding: 0 2px 0 8px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: none;
+        color: var(--muted);
+        font: inherit;
+        font-size: 12.5px;
+        cursor: pointer;
+      }
+      .app-player-filter:hover {
+        color: var(--ink);
+        border-color: var(--rule);
+      }
+      .app-player-filter option {
+        color: var(--ink);
+      }
+      .app-only-toggle {
+        height: 30px;
+        padding: 0 10px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: none;
+        color: var(--muted);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        white-space: nowrap;
+        cursor: pointer;
+      }
+      .app-only-toggle:hover {
+        color: var(--ink);
+        border-color: var(--rule);
+      }
+      .app-only-toggle[aria-pressed="true"] {
+        border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+        background: color-mix(in srgb, var(--accent) 12%, transparent);
+        color: var(--accent);
       }
       .app-refresh {
         display: grid;
@@ -940,6 +1091,12 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         font: inherit;
         text-align: left;
         cursor: pointer;
+      }
+      /* A match with the filtered player: accent bar and a faint tint; the
+         hover/open state still reads over it. */
+      .match-row--hit {
+        box-shadow: inset 2px 0 0 var(--accent);
+        background: color-mix(in srgb, var(--accent) 8%, transparent);
       }
       .match-row:hover,
       .match-row[aria-pressed="true"] {

@@ -37,6 +37,8 @@ REPLAYS = ROOT / "var" / "replays"
 CH_URL = os.environ.get(
     "CH_URL", "http://clickhouse-service.cluster-services.svc.cluster.local:8123/")
 OD_URL = "https://api.opendota.com/api/matches/"
+OD_PLAYERS = "https://api.opendota.com/api/players/"
+SQUAD_NAMES = STORE / "squad_names.json"
 USER_AGENT = "dota2-replays/1.0"
 SQL = (
     # The recent window and the squad members (positive account ids) seen in
@@ -136,6 +138,39 @@ def load_job(match_id: int) -> dict | None:
 
 def is_parsed(match_id: int) -> bool:
     return (MATCHES / str(match_id) / "fights" / "index.json").is_file()
+
+
+def squad_names(ids: set[int]) -> dict[int, str]:
+    """account_id -> display name, cached on disk; ids missing there come
+    from OpenDota once each (the player-filter dropdown shows them)."""
+    names: dict[int, str] = {}
+    if SQUAD_NAMES.is_file():
+        try:
+            raw = json.loads(SQUAD_NAMES.read_text())
+            names = {int(k): v for k, v in raw.items() if isinstance(v, str)}
+        except Exception:
+            pass
+    changed = False
+    for aid in sorted(ids - names.keys()):
+        req = urllib.request.Request(
+            f"{OD_PLAYERS}{aid}", headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                prof = (json.loads(resp.read().decode("utf-8")).get("profile") or {})
+            name = prof.get("personaname")
+            if isinstance(name, str) and name:
+                names[aid] = name
+                changed = True
+        except Exception:
+            pass  # unknowns stay bare account ids this round
+    if changed:
+        try:
+            tmp = SQUAD_NAMES.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(names, indent=1) + "\n")
+            os.replace(tmp, SQUAD_NAMES)
+        except Exception:
+            pass
+    return names
 
 
 def parsed_match_ids() -> list[int]:
@@ -708,7 +743,11 @@ class Handler(BaseHTTPRequestHandler):
                 "latest_timestamp": time.strftime(fmt, time.gmtime(ts)) if ts else "",
             })
         matches.sort(key=lambda m: str(m.get("latest_timestamp", "")), reverse=True)
-        self.send_json(200, {"matches": matches, "players": sorted(squad)})
+        names = squad_names(squad)
+        self.send_json(200, {"matches": matches, "players": [
+            {"account_id": aid, "name": names.get(aid, str(aid))}
+            for aid in sorted(squad)
+        ]})
 
     def api_match(self, match_id: int) -> None:
         job = load_job(match_id)
