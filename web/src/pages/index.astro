@@ -202,6 +202,10 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       let selected: number | null = null;
       let pollTimer: ReturnType<typeof setInterval> | null = null;
       const rowStates = new Map<number, RowState>();
+      // What every rendered row was built from, so a scoreboard that lands
+      // after the list (fillRowDecor) can be painted into that row without
+      // re-reading the list.
+      const rowItems = new Map<number, MatchListItem>();
 
       const stopPoll = () => {
         if (pollTimer !== null) {
@@ -229,11 +233,11 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         const ticket = listSeq;
         rowStates.set(id, "fetching");
         updateRowState(id);
-        let parsed: boolean;
+        let info: MatchInfo;
         try {
           const res = await fetch(`/api/matches/${id}?${bust()}`);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          parsed = ((await res.json()) as MatchInfo).parsed;
+          info = (await res.json()) as MatchInfo;
         } catch {
           if (ticket !== listSeq) return;
           rowStates.set(id, "error");
@@ -241,8 +245,12 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
           return;
         }
         if (ticket !== listSeq) return;
-        rowStates.set(id, parsed);
+        rowStates.set(id, info.parsed);
         updateRowState(id);
+        // This fetch is also what caches the scoreboard the list draws its
+        // portraits from, so a row that came up bare picks them up here
+        // instead of waiting for the next refresh.
+        fillRowDecor(id, info);
       }
 
       // Our team's five hero portraits: the squad members wear their full
@@ -261,6 +269,65 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
           .join("");
       }
 
+      // The win/loss chip ahead of the portraits, for a lineup we could score.
+      function winHtml(m: MatchListItem): string {
+        const scored = m.lineup !== undefined && m.lineup !== null;
+        return (scored && m.win === true
+          ? `<span class="match-win match-win--w" role="img" aria-label="Won" title="Won"></span>`
+          : "") +
+          (scored && m.win === false
+            ? `<span class="match-win match-win--l" role="img" aria-label="Lost" title="Lost"></span>`
+            : "");
+      }
+
+      // The server's lineup_from_cache, run on a board already in hand: our
+      // side is the one with more of this match's squad account ids on file
+      // and the win is radiant_win read from that side's point of view. A
+      // tie between the sides (or a board that doesn't say who won) scores
+      // nothing, exactly as the list would draw it.
+      function lineupFromBoard(
+        board: Scoreboard,
+        ids: Set<number>,
+      ): { lineup: NonNullable<MatchListItem["lineup"]>; win: boolean | null } | null {
+        const teams = [board.radiant, board.dire].map((rows) => {
+          const lineup = rows.map((p) => ({
+            a: typeof p.account_id === "number" && p.account_id > 0 ? p.account_id : null,
+            h: typeof p.hero_icon === "string" ? p.hero_icon : null,
+          }));
+          const squad = rows.filter(
+            (p) => typeof p.account_id === "number" && p.account_id > 0 && ids.has(p.account_id),
+          ).length;
+          return { lineup, squad };
+        });
+        if (teams[0].squad === teams[1].squad) return null;
+        const ours = teams[0].squad > teams[1].squad ? 0 : 1;
+        const radiantWin = board.radiant_win;
+        const win: boolean | null = typeof radiantWin === "boolean"
+          ? (ours === 0 ? radiantWin : !radiantWin)
+          : null;
+        return { lineup: teams[ours].lineup, win };
+      }
+
+      // A row drawn before its scoreboard was cached learns that board's
+      // portraits and result from the fetch fillState just made, so it ends
+      // up as a refresh would draw it — no second trip through the list.
+      function fillRowDecor(id: number, info: MatchInfo): void {
+        const m = rowItems.get(id);
+        const board = info.scoreboard;
+        if (m === undefined || board === null) return;
+        if (m.lineup !== undefined && m.lineup !== null) return; // already scored
+        const pulled = lineupFromBoard(board, new Set(m.account_ids ?? []));
+        if (pulled === null) return;
+        m.lineup = pulled.lineup;
+        m.win = pulled.win;
+        const top = listEl.querySelector(`[data-match="${id}"]`)?.querySelector(".match-row-top");
+        if (!top) return;
+        top.innerHTML =
+          winHtml(m) +
+          `<span class="match-team">${teamPortraits(m)}</span>` +
+          `<span class="match-state" data-state>${stateHtml(rowStates.get(id))}</span>`;
+      }
+
       function rowFor(m: MatchListItem, shared = false): HTMLLIElement {
         const when = new Date(m.latest_timestamp.replace(" ", "T") + "Z");
         const date = shared
@@ -271,18 +338,16 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         const li = document.createElement("li");
         const hit = filterPlayer !== null && !shared
           && (m.account_ids ?? []).includes(filterPlayer);
-        const won = m.lineup !== undefined && m.win === true;
-        const lost = m.lineup !== undefined && m.win === false;
         li.innerHTML =
           `<button type="button" class="match-row${hit ? " match-row--hit" : ""}" data-match="${m.match_id}" aria-pressed="${String(m.match_id === selected)}" title="Match ${m.match_id}">` +
           `<span class="match-row-top">` +
-          (won ? `<span class="match-win match-win--w" role="img" aria-label="Won" title="Won"></span>` : "") +
-          (lost ? `<span class="match-win match-win--l" role="img" aria-label="Lost" title="Lost"></span>` : "") +
+          winHtml(m) +
           `<span class="match-team">${teamPortraits(m)}</span>` +
           `<span class="match-state" data-state>${stateHtml(rowStates.get(m.match_id))}</span></span>` +
           `<span class="match-date">${text(date)}</span>` +
           `</button>`;
         li.querySelector("button")!.addEventListener("click", () => selectMatch(m.match_id));
+        rowItems.set(m.match_id, m);
         return li;
       }
 
@@ -292,6 +357,7 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         listNote.textContent = "Loading matches…";
         listEl.hidden = true;
         listEl.replaceChildren();
+        rowItems.clear();
         let items: MatchListItem[];
         try {
           const res = await fetch(`/api/matches?${bust()}`);
@@ -302,6 +368,10 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
           };
           items = body.matches;
           squadPlayers = new Map(body.players.map((p) => [p.account_id, p.name]));
+          // The squad only exists once this response lands, and a shared ?m=
+          // draws its scoreboard before it: mark the board (and the open
+          // card) now, so the highlight never depends on which won the race.
+          markSquad();
         } catch (err) {
           if (ticket !== listSeq) return;
           const msg = `Could not load matches: ${(err as Error).message}`;
@@ -467,6 +537,9 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         if (ticket !== matchSeq) return;
         rowStates.set(id, info.parsed);
         updateRowState(id);
+        // This board is the one the list row waits on when its scoreboard
+        // wasn't cached yet (fillState races it and either one may land).
+        fillRowDecor(id, info);
         // Nothing here touches the page: the scoreboard and the body are built
         // complete, then replace the old ones in one go.
         const board = scoreboardNodes(info);
@@ -491,7 +564,7 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
 
       function teamTable(side: "radiant" | "dire", rows: PlayerRow[], winner: boolean, kills: number): string {
         const cells = (p: PlayerRow, i: number) =>
-          `<tr data-side="${side}" data-i="${i}" role="button" tabindex="0" aria-pressed="false"` +
+          `<tr data-side="${side}" data-i="${i}" data-account="${p.account_id ?? ""}" role="button" tabindex="0" aria-pressed="false"` +
           ` aria-label="Full match stats for ${text(p.player)}"` +
           `${p.account_id !== null && p.account_id !== undefined && squadPlayers.has(p.account_id) ? ` class="sb-squad"` : ""}>` +
           `<td class="sb-player">${text(p.player)}</td>` +
@@ -517,6 +590,21 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
           `</tr></thead><tbody>${rows.map((p, i) => cells(p, i)).join("")}</tbody></table>` +
           `</section>`
         );
+      }
+
+      // Tint the scoreboard rows that belong to the squad, and re-render the
+      // open player card so its tag agrees. teamTable already knows the squad
+      // when the list arrived first; this is the other order — a shared ?m=
+      // fetched its board while squadPlayers was still empty.
+      function markSquad(): void {
+        for (const tr of scoreboardEl.querySelectorAll<HTMLTableRowElement>("tr[data-side]")) {
+          const id = Number(tr.dataset.account);
+          tr.classList.toggle(
+            "sb-squad",
+            Number.isSafeInteger(id) && id > 0 && squadPlayers.has(id),
+          );
+        }
+        if (cardSel !== null) setCard(cardSel);
       }
 
       function whenLabel(start: number | null): string {
