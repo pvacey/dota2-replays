@@ -28,14 +28,40 @@ export function itemClock(s: number): string {
   return `${sign}${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, "0")}`;
 }
 
-const ICON_W = 22;
+const ICON_W = 36;
 const COUNT_W = 18;
-const ROW_H = 20;
+const ROW_H = 30;
 const GAP = 3;
 const STEP = 300; // ruler tick every 5 game minutes
 const RULER_H = 28; // the sticky ruler's viewport height, for tooltip flipping
 
 type ItemRow = ItemLanesPlayer["items"][number];
+
+/** Shop cost per item key (from /data/items.json); keys the table lacks rank
+ * below every priced entry. */
+export type ItemCosts = Record<string, number>;
+
+let costsPromise: Promise<ItemCosts> | null = null;
+
+/** The shop-cost table the run collapse ranks entries by. Fetched once per
+ * page load; a failed fetch frees the cache so the next match retries. */
+export function loadItemCosts(): Promise<ItemCosts> {
+  if (!costsPromise) {
+    costsPromise = fetch("/data/items.json")
+      .then((res) => (res.ok ? res.json() : {}))
+      .then((raw: Record<string, { cost?: unknown }>) => {
+        const costs: ItemCosts = {};
+        for (const [key, entry] of Object.entries(raw)) {
+          if (typeof entry?.cost === "number") costs[key] = entry.cost;
+        }
+        return costs;
+      });
+    costsPromise.catch(() => {
+      costsPromise = null;
+    });
+  }
+  return costsPromise;
+}
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -55,19 +81,40 @@ function titleOf(item: ItemRow): string {
 }
 
 /**
- * Several purchases logged at the same second — a combine chain (its
- * components come through the log together with the finished item) or a
- * ward stack-up — are one event on the chart: keep the final item of the run.
- * The pre-horn run is the starting build, not a combine, so it stays whole.
+ * Several purchases logged at the same second are one event on the chart. A
+ * quickbuy logs the finished item among its components in no fixed order (a
+ * Divine Rapier logs as relic, rapier, demon_edge), so the run's costliest
+ * entry is the finished build — a finished item always prices at least its
+ * dearest component — and its repeated buys in the run stack the count. Runs
+ * with no priced entry keep the last entry, as do unpriced ties. The pre-horn
+ * run is the starting build, not a combine, so it stays whole.
  */
-function collapseRuns(items: ItemRow[]): ItemRow[] {
+export function collapseRuns(items: ItemRow[], costs: ItemCosts): ItemRow[] {
   const out: ItemRow[] = [];
+  let run: ItemRow[] = [];
+  const flush = (): void => {
+    if (run.length) out.push(keeperOf(run, costs));
+    run = [];
+  };
   for (const item of items) {
-    const prev = out[out.length - 1];
-    if (prev && prev[0] === item[0] && item[0] > 0) out[out.length - 1] = item;
-    else out.push(item);
+    const prev = run[run.length - 1];
+    if (item[0] > 0 && prev && prev[0] === item[0]) run.push(item);
+    else {
+      flush();
+      run = [item];
+    }
   }
+  flush();
   return out;
+}
+
+function keeperOf(run: ItemRow[], costs: ItemCosts): ItemRow {
+  const costOf = (row: ItemRow): number => costs[row[1]] ?? -1;
+  let best = run[0];
+  for (const row of run) if (costOf(row) >= costOf(best)) best = row;
+  if (costOf(best) < 0) return best;
+  const count = run.filter((row) => row[1] === best[1]).length;
+  return [best[0], best[1], best[2], count];
 }
 
 /**
@@ -112,8 +159,8 @@ function laneIcons(lane: HTMLElement, items: ItemRow[], width: number, span: num
     const img = el("img", "lane-item-icon", null);
     img.src = `/data/icons/items/${item[1]}.png`;
     img.alt = item[2];
-    img.width = 22;
-    img.height = 16;
+    img.width = 36;
+    img.height = 26;
     img.loading = "lazy";
     img.addEventListener("error", () => {
       const dot = el("span", "lane-item-dot");
@@ -126,7 +173,7 @@ function laneIcons(lane: HTMLElement, items: ItemRow[], width: number, span: num
   lane.style.height = `${rows * ROW_H + 4}px`;
 }
 
-export function mountItems(host: HTMLElement, data: ItemLanesData): void {
+export function mountItems(host: HTMLElement, data: ItemLanesData, costs: ItemCosts = {}): void {
   const times = data.players.flatMap((player) => player.items.map(([t]) => t));
   const start = Math.min(data.start_s, ...(times.length ? times : []));
   const end = Math.max(data.end_s, ...(times.length ? times : []));
@@ -231,7 +278,7 @@ export function mountItems(host: HTMLElement, data: ItemLanesData): void {
       );
       const lane = el("div", "items-lane");
       lanes.append(el("div", "items-row", labelCell, lane));
-      drawn.push([collapseRuns(player.items), lane]);
+      drawn.push([collapseRuns(player.items, costs), lane]);
     }
   }
 

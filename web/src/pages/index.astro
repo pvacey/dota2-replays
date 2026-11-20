@@ -665,7 +665,7 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         const [key, name] = slot;
         return (
           `<img class="sb-slot ${extra}" src="/data/icons/items/${text(key)}.png" ` +
-          `alt="${text(name)}" title="${text(name)}" width="32" height="32" loading="lazy">`
+          `alt="${text(name)}" title="${text(name)}" width="38" height="38" loading="lazy">`
         );
       }
 
@@ -884,9 +884,11 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
           return () => pane.replaceChildren(errorNote(`Could not load the item timelines: ${msg}`));
         }
         if (stale()) return null;
-        const { mountItems } = await import("../lib/items-lanes");
+        const { mountItems, loadItemCosts } = await import("../lib/items-lanes");
         if (stale()) return null;
-        return () => mountItems(pane, data);
+        const costs = await loadItemCosts();
+        if (stale()) return null;
+        return () => mountItems(pane, data, costs);
       }
 
       function showItemsMissing(id: number, info: MatchInfo, pane: HTMLElement): void {
@@ -1595,8 +1597,8 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       }
       .sb-slot {
         display: block;
-        width: 32px;
-        height: 32px;
+        width: 38px;
+        height: 38px;
         border: 1px solid var(--line);
         border-radius: 4px;
         background: var(--bg);
@@ -1881,7 +1883,7 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
       }
       .items-lane {
         position: relative;
-        min-height: 24px;
+        min-height: 34px;
         border-bottom: 1px solid var(--line);
         background: linear-gradient(90deg, var(--accent-soft) 0, var(--accent-soft) var(--horn-x), transparent var(--horn-x));
       }
@@ -1889,7 +1891,7 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         position: absolute;
         display: flex;
         align-items: center;
-        height: 16px;
+        height: 26px;
       }
       .lane-item-icon {
         display: block;
@@ -1904,8 +1906,8 @@ const points = (list: number[][]) => list.map(([x, y]) => `${x},${y}`).join(" ")
         font-style: normal;
       }
       .lane-item-dot {
-        width: 8px;
-        height: 8px;
+        width: 10px;
+        height: 10px;
         border-radius: 50%;
         background: var(--line);
       }
