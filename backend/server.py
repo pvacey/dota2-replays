@@ -706,6 +706,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_file(target)
 
     def data_get(self, path: str) -> None:
+        if path == "/data/items.json":
+            # The item timeline fetches the shop-cost table for collapsing
+            # same-second purchase runs (a quickbuy logs the finished item
+            # among its components; costs tell them apart).
+            self.send_file(ITEMS_JSON)
+            return
         for prefix, root in (("/data/icons/heroes/", HERO_ICONS),
                              ("/data/icons/items/", ITEM_ICONS)):
             if path.startswith(prefix):

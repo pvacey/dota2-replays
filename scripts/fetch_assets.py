@@ -2,9 +2,14 @@
 
 `data/` is not committed. This script fills it from reproducible sources:
 
-- `data/heroes.json` + `data/items.json` — copied from the installed `gem`
-  wheel (its own catalog JSONs; keep `gem-dota==0.14.0` pinned so the copies
-  are stable);
+- `data/heroes.json` — copied from the installed `gem` wheel (its own catalog
+  JSON; keep `gem-dota==0.14.0` pinned so the copy is stable);
+- `data/items.json` — the wheel's copy enriched with per-item shop `cost`
+  from odota's dotaconstants (pinned version): the item timeline collapses
+  each same-second purchase run to its costliest entry, which is how it
+  tells a quickbuy's finished item apart from the components the shop logged
+  around it (a Divine Rapier logs as relic, rapier, demon_edge — the rapier
+  is neither first nor last);
 - `data/icons/heroes/*.png` and `data/icons/items/*.png` — downloaded from
   the Dota 2 CDN (same URL patterns as gem's `scripts/_icons.py`), named
   from the wheel's `heroes.json` / `items.json`;
@@ -23,6 +28,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import ssl
 import sys
@@ -38,6 +44,12 @@ ICON_DIRS = (DATA / "icons" / "heroes", DATA / "icons" / "items")
 
 MAP_URL = "https://raw.githubusercontent.com/whanyu1212/gem-dota/v0.14.0/assets/maps/Game_map_7.41.jpg"
 MAP_SHA256 = "9fb56fc131acc161fb904f6c7189c6f37c57705bac752ccf9a47e01b1b079764"
+
+# Costs ride on a pinned dotaconstants build, same reproducibility rule as the
+# pinned gem wheel: relative costs (what the timeline collapse needs) hold
+# across patches even when the numbers themselves drift.
+DOTACONSTANTS_VERSION = "10.9.0"
+DOTACONSTANTS_URL = f"https://unpkg.com/dotaconstants@{DOTACONSTANTS_VERSION}/build/items.json"
 
 HERO_CDN_URLS = (
     "https://cdn.cloudflare.steamstatic.com/apps/dota2/images/heroes/{short}_icon.png",
@@ -57,13 +69,53 @@ def _wheel_json(name: str) -> dict:
 
 
 def catalog_jsons(*, force: bool) -> None:
-    """The wheel's catalog JSONs the backend reads (heroes and items)."""
+    """The wheel's catalog JSONs the backend reads (heroes and items), with
+    items.json enriched by shop costs."""
     for name in ("heroes.json", "items.json"):
         target = DATA / name
         if target.exists() and not force:
             continue
         DATA.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(resources.files("gem").joinpath(f"data/{name}"), target)
+    _item_costs(force=force)
+
+
+def _item_costs(*, force: bool) -> None:
+    """Merge dotaconstants' shop costs into data/items.json (idempotent).
+
+    The wheel's items.json is {key: {id, dname}}; each entry gains a ``cost``
+    so the timeline can rank entries of a same-second purchase run. Idempotent:
+    a copy that already has costs is left alone unless --force.
+    """
+    items = DATA / "items.json"
+    if not items.is_file():
+        return
+    raw = json.loads(items.read_text())
+    if not force and any(
+        isinstance(entry.get("cost"), (int, float))
+        for entry in raw.values()
+        if isinstance(entry, dict)
+    ):
+        return
+    request = urllib.request.Request(
+        DOTACONSTANTS_URL, headers={"User-Agent": "replays/0.1 asset fetch"})
+    with urllib.request.urlopen(request, timeout=60, context=ssl.create_default_context()) as r:
+        dota = json.loads(r.read().decode("utf-8"))
+    merged = 0
+    for key, entry in raw.items():
+        row = dota.get(key)
+        if not isinstance(entry, dict) or not isinstance(row, dict):
+            continue
+        cost = row.get("cost")
+        if isinstance(cost, (int, float)):
+            entry["cost"] = cost
+            merged += 1
+    if not merged:
+        raise ValueError(f"dotaconstants {DOTACONSTANTS_VERSION} merged no costs")
+    tmp = items.with_name("items.json.tmp")
+    tmp.write_text(json.dumps(raw, separators=(",", ":")) + "\n")
+    os.replace(tmp, items)
+    print(f"items.json: added {merged} shop costs from dotaconstants {DOTACONSTANTS_VERSION}")
 
 
 def _shorts(json_name: str, *, prefix: str) -> list[str]:
@@ -145,6 +197,13 @@ def check() -> int:
     problems: list[str] = []
     if not (DATA / "heroes.json").is_file():
         problems.append("data/heroes.json missing")
+    items = DATA / "items.json"
+    if not items.is_file():
+        problems.append("data/items.json missing")
+    else:
+        entry = json.loads(items.read_text()).get("rapier") or {}
+        if not isinstance(entry.get("cost"), (int, float)):
+            problems.append("data/items.json lacks shop costs — run: uv run scripts/fetch_assets.py")
     for label, out, json_name, prefix in (("heroes", ICON_DIRS[0], "heroes.json", "npc_dota_hero_"),):
         expected = len(_shorts(json_name, prefix=prefix))
         found = len(list(out.glob("*.png"))) if out.is_dir() else 0
